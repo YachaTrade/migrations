@@ -1,20 +1,25 @@
 -- ============================================================================
 -- 0001_init.sql — GIWA observer fresh-DB consolidated migration
 --
--- Generated 2026-07-19 from giwa/observer migrations (branch
--- feat/market-type-nadfun-uniswapv3), concatenated in the order the observer
--- test harness applies them (tests/common/mod.rs::apply_baseline_migrations),
--- with GIWA-runtime pruning:
+-- Generated 2026-07-19 from giwa/observer migrations, concatenated in the
+-- order the observer test harness applies them
+-- (tests/common/mod.rs::apply_baseline_migrations), with GIWA-runtime pruning:
 --
 --   * numbered 0001..0036, excluding 1000_delete.sql and 0018_api_keys.sql
 --     (prod-only pgactive extension)
 --   * 0015_v2_events.sql: only v2_sniping_history kept — the v2 fee tables
---     and v2_lp_allocate_history are not indexed by the GIWA runtime
---   * vault.sql, dividend.sql, v2_upgrade_*.sql: dropped (no vault/dividend
---     handlers; upgrade/backfill scripts are Monad-era prod-DB tooling)
+--     (v2_fee_collect/settle/to_claim_history, v2_creator_fee_distribution)
+--     and v2_lp_allocate_history are NOT indexed by the GIWA 6-handler
+--     runtime (LpManager writes the v1 lp_allocate_history instead)
+--   * vault.sql, dividend.sql: dropped — no vault/dividend handlers in the
+--     GIWA runtime; nothing writes these tables
+--   * v2_upgrade_new_tables.sql: dropped — duplicate IF NOT EXISTS copies of
+--     0014/0031 tables plus the dropped v2 fee tables (prod-upgrade script)
+--   * v2_upgrade_alter.sql and other v2_upgrade_* backfills: dropped —
+--     Monad-era prod-DB upgrade scripts, invalid on a fresh GIWA database
 --
--- Contract: market_type values are 'NADFUN' (bonding curve) and 'UNISWAPV3'
--- (dex). Quote defaults/seeds reference the GIWA WETH predeploy
+-- Target: fresh PostgreSQL 17 database for GIWA Sepolia indexing.
+-- Quote defaults/seeds reference the GIWA WETH predeploy
 -- 0x4200000000000000000000000000000000000006.
 -- ============================================================================
 
@@ -441,7 +446,7 @@ CREATE TABLE IF NOT EXISTS token_metadata(
 
 -- Market
 CREATE TABLE IF NOT EXISTS market (
-    market_type VARCHAR NOT NULL CHECK (market_type IN ('NADFUN', 'UNISWAPV3')),
+    market_type VARCHAR NOT NULL CHECK (market_type IN ('CURVE', 'DEX', 'V2_CURVE', 'V2_DEX')),
     token_id VARCHAR NOT NULL,
     pool_id VARCHAR NULL,
     reserve_quote NUMERIC NULL, --liquidity; quote raw (wei): raw on-chain reserve of the quote token
@@ -457,8 +462,8 @@ CREATE TABLE IF NOT EXISTS market (
 );
 
 -- Market 테이블 복합 인덱스 (observer는 쓰기 위주이므로 필요한 것만)
-CREATE INDEX IF NOT EXISTS idx_market_token_id_market_type ON market (token_id, market_type) WHERE market_type = 'UNISWAPV3';
-CREATE INDEX IF NOT EXISTS idx_market_pool_dex ON market (pool_id, market_type) WHERE market_type = 'UNISWAPV3';
+CREATE INDEX IF NOT EXISTS idx_market_token_id_market_type ON market (token_id, market_type) WHERE market_type = 'DEX';
+CREATE INDEX IF NOT EXISTS idx_market_pool_dex ON market (pool_id, market_type) WHERE market_type = 'DEX';
 
 -- API Token 모듈 최적화: 정렬 쿼리용 인덱스
 CREATE INDEX IF NOT EXISTS idx_market_price ON market (price DESC);
@@ -782,7 +787,7 @@ CREATE TABLE IF NOT EXISTS swap (
     account_id VARCHAR(42) NOT NULL,
     token_id VARCHAR(42) NOT NULL,
     -- market type
-    market_type VARCHAR NOT NULL CHECK (market_type IN ('NADFUN', 'UNISWAPV3')),
+    market_type VARCHAR NOT NULL CHECK (market_type IN ('CURVE', 'DEX', 'V2_CURVE', 'V2_DEX')),
     is_buy BOOLEAN NOT NULL,
     quote_amount NUMERIC NOT NULL,   -- UNIT: quote raw (wei) (buy=amount_in / sell=amount_out; observer src/event/v1/curve/receive.rs:431,530)
     token_amount NUMERIC NOT NULL,   -- UNIT: token raw (wei) (buy=amount_out / sell=amount_in; observer src/event/v1/curve/receive.rs:432,531)
@@ -991,6 +996,8 @@ CREATE TABLE IF NOT EXISTS burn(
 );
 
 CREATE INDEX IF NOT EXISTS idx_burn_block_number_tx_index_log_index ON burn (block_number ASC, tx_index ASC, log_index ASC);
+
+
 
 
 -- ============================================================================
