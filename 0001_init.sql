@@ -13,6 +13,10 @@
 --     observer indexes vault/vault_registry/dividend events, and api-server
 --     reads the fee/vault/dividend tables.
 --   * v2_upgrade_*.sql: dropped — Monad-era prod-DB upgrade/backfill tooling
+--   * 0036_token_x_verification.sql and the dev_post files (0037, 0039-0042)
+--     come from the api-server migrations lineage, not the observer's. The
+--     observer never writes them; api-server does, and both services share
+--     this database.
 --
 -- Naming: the Monad-era v2_ prefix is gone from every table, index, trigger
 -- and function name — GIWA runs a single contract generation. The dead
@@ -5877,3 +5881,211 @@ UPDATE creator_fee_distribution_stats v
    AND v.distributed_quote_usd = 0;
 
 COMMIT;
+
+-- ============================================================================
+-- >>> 0036_token_x_verification.sql
+-- ============================================================================
+
+-- 0036_token_x_verification.sql
+--
+-- X (Twitter) hidden-creator verification signals, scoped to a single coin:
+-- pre-deploy reservation, creator self-verification, and public follower
+-- attestations (including X's official "blue badge" status on each
+-- attestation). See: docs/plans/2026-07-03-x-hidden-creator-verification-design.md
+-- (§3-bis, §4, §7.1-B).
+--
+-- No FK to `token` anywhere in this file: at reserve/finalize time the token
+-- row does not exist yet (the Observer indexer creates it later from the
+-- on-chain event).
+
+-- Creator self-verification result (follower count + own X handle). x_user_id
+-- and x_handle are internal (operational/admin) — never exposed by the API.
+CREATE TABLE IF NOT EXISTS token_x_verification (
+    token_id VARCHAR(42) PRIMARY KEY,
+    account_id VARCHAR(42) NOT NULL,
+    x_user_id VARCHAR(32) NOT NULL,
+    x_handle VARCHAR(16),
+    followers_count BIGINT NOT NULL,
+    verified_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_token_x_verification_account_id
+    ON token_x_verification (account_id);
+
+-- Third-party handles that provably follow the creator (max 3, public).
+-- Handles that do NOT follow are never stored. is_x_verified carries X's
+-- official "blue badge" status for the handle — a trust signal about the
+-- PUBLIC third-party handle, not the hidden creator.
+CREATE TABLE IF NOT EXISTS token_x_followed_by (
+    token_id VARCHAR(42) NOT NULL
+        REFERENCES token_x_verification(token_id) ON DELETE CASCADE,
+    x_handle VARCHAR(16) NOT NULL,
+    x_image_uri VARCHAR NOT NULL,
+    x_followers_count BIGINT NOT NULL,
+    is_x_verified BOOLEAN NOT NULL DEFAULT FALSE,
+    checked_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (token_id, x_handle)
+);
+
+-- Pre-deploy reservation binding a CREATE2 token_id to a session account while
+-- the salt is still secret (before on-chain deployment). finalize checks only
+-- that this reservation belongs to the session (design §3-bis, §7.1-B).
+--
+-- No FK to `token` or `token_x_verification`: the reservation is created BEFORE
+-- either row exists. token_id is stored EIP-55 checksummed (never LOWER()).
+-- The row is immutable once created (account_id never changes) — this is what
+-- makes the reserve INSERT a sound first-writer-wins record.
+CREATE TABLE IF NOT EXISTS token_x_reservation (
+    token_id VARCHAR(42) PRIMARY KEY,
+    account_id VARCHAR(42) NOT NULL,
+    reserved_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_token_x_reservation_account_id
+    ON token_x_reservation (account_id);
+
+-- ============================================================================
+-- >>> 0037_dev_post.sql
+-- ============================================================================
+
+-- Dev Post feature: coin-creator posts with images, polls, likes, votes.
+-- Design: docs/plans/2026-07-07-dev-post-api-design.md
+-- pgactive: surrogate key via snowflake; all other tables use natural composite keys.
+CREATE SEQUENCE IF NOT EXISTS dev_post_snowflake_seq;
+
+CREATE TABLE IF NOT EXISTS dev_post (
+    id          BIGINT PRIMARY KEY DEFAULT pgactive.pgactive_snowflake_id_nextval('dev_post_snowflake_seq'),
+    token_id    VARCHAR(42) NOT NULL,
+    author      VARCHAR(42) NOT NULL,
+    body        TEXT        NOT NULL DEFAULT '',
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    edited_at   TIMESTAMPTZ,
+    deleted_at  TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_dev_post_token_created ON dev_post (token_id, created_at DESC) WHERE deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_dev_post_created       ON dev_post (created_at DESC)            WHERE deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_dev_post_author        ON dev_post (author)                     WHERE deleted_at IS NULL;
+
+CREATE TABLE IF NOT EXISTS dev_post_image (
+    post_id   BIGINT   NOT NULL REFERENCES dev_post(id) ON DELETE CASCADE,
+    position  SMALLINT NOT NULL,
+    image_uri TEXT     NOT NULL,
+    PRIMARY KEY (post_id, position)
+);
+
+CREATE TABLE IF NOT EXISTS dev_post_poll (
+    post_id   BIGINT      PRIMARY KEY REFERENCES dev_post(id) ON DELETE CASCADE,
+    closes_at TIMESTAMPTZ NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS dev_post_poll_option (
+    post_id   BIGINT   NOT NULL REFERENCES dev_post_poll(post_id) ON DELETE CASCADE,
+    position  SMALLINT NOT NULL,
+    label     TEXT     NOT NULL,
+    image_uri TEXT,
+    PRIMARY KEY (post_id, position)
+);
+
+CREATE TABLE IF NOT EXISTS dev_post_like (
+    post_id    BIGINT      NOT NULL REFERENCES dev_post(id) ON DELETE CASCADE,
+    account_id VARCHAR(42) NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (post_id, account_id)
+);
+CREATE INDEX IF NOT EXISTS idx_dev_post_like_created ON dev_post_like (created_at, post_id);
+
+CREATE TABLE IF NOT EXISTS dev_post_poll_vote (
+    post_id         BIGINT      NOT NULL REFERENCES dev_post_poll(post_id) ON DELETE CASCADE,
+    account_id      VARCHAR(42) NOT NULL,
+    option_position SMALLINT    NOT NULL,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (post_id, account_id),
+    FOREIGN KEY (post_id, option_position) REFERENCES dev_post_poll_option(post_id, position)
+);
+
+-- ============================================================================
+-- >>> 0039_dev_post_pin.sql
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS dev_post_pin (
+    token_id VARCHAR(42) PRIMARY KEY
+        REFERENCES token(token_id) ON DELETE CASCADE,
+    post_id BIGINT NOT NULL UNIQUE
+        REFERENCES dev_post(id) ON DELETE CASCADE,
+    pinned_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- ============================================================================
+-- >>> 0040_dev_post_moderation_log.sql
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS dev_post_moderation_log (
+    id               UUID        PRIMARY KEY,
+    post_id          BIGINT      NOT NULL CHECK (post_id > 0),
+    token_id         VARCHAR(42) NOT NULL,
+    admin_account_id VARCHAR(42) NOT NULL,
+    action           VARCHAR(8)  NOT NULL
+        CHECK (action IN ('DELETE', 'RESTORE')),
+    changed          BOOLEAN     NOT NULL,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
+);
+
+CREATE INDEX IF NOT EXISTS idx_dev_post_moderation_log_post_created
+    ON dev_post_moderation_log (post_id, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_dev_post_moderation_log_admin_created
+    ON dev_post_moderation_log (admin_account_id, created_at DESC);
+
+-- ============================================================================
+-- >>> 0041_dev_post_title.sql
+-- ============================================================================
+
+ALTER TABLE dev_post
+    ADD COLUMN title TEXT NOT NULL DEFAULT '';
+
+WITH legacy AS (
+    SELECT id, body AS legacy_body, strpos(body, E'\n') AS first_lf
+    FROM dev_post
+)
+UPDATE dev_post AS dp
+SET title = CASE
+        WHEN legacy.first_lf = 0 THEN legacy.legacy_body
+        ELSE left(
+            legacy.legacy_body,
+            legacy.first_lf - 1
+                - CASE
+                    WHEN legacy.first_lf > 1
+                     AND substr(legacy.legacy_body, legacy.first_lf - 1, 1) = E'\r'
+                    THEN 1 ELSE 0
+                  END
+        )
+    END,
+    body = CASE
+        WHEN legacy.first_lf = 0 THEN ''
+        ELSE substr(legacy.legacy_body, legacy.first_lf + 1)
+    END
+FROM legacy
+WHERE dp.id = legacy.id;
+
+-- ============================================================================
+-- >>> 0042_dev_post_daily_limit.sql
+-- ============================================================================
+
+-- Daily dev-post limit support: up to N posts (currently 3, app-enforced)
+-- per token per UTC calendar day.
+--
+-- posted_on is a stored generated column so the app's count gate
+-- (`WHERE token_id = $1 AND posted_on = <today UTC>`) is a cheap indexed
+-- lookup. Enforcement lives in create_post's CTE — a unique index can cap at
+-- exactly one row but cannot express "at most 3", so a burst of concurrent
+-- creates can momentarily exceed the cap; acceptable for spam limiting.
+--
+-- Deleted posts still count toward the day's quota (the app counts without a
+-- deleted_at filter): deleting does not free a slot, edits exist for
+-- corrections.
+ALTER TABLE dev_post
+    ADD COLUMN IF NOT EXISTS posted_on DATE
+    GENERATED ALWAYS AS ((created_at AT TIME ZONE 'UTC')::date) STORED;
+
+CREATE INDEX IF NOT EXISTS idx_dev_post_token_daily
+    ON dev_post (token_id, posted_on);
