@@ -5,8 +5,10 @@
 -- order the observer test harness applies them
 -- (tests/common/mod.rs::apply_baseline_migrations), with GIWA-runtime pruning:
 --
---   * numbered 0001..0036, excluding 1000_delete.sql and 0018_api_keys.sql
---     (prod-only pgactive extension)
+--   * numbered 0001..0035, excluding 1000_delete.sql and 0018_api_keys.sql
+--     (prod-only pgactive extension); 0036_token_chain.sql dropped and the
+--     token.version column removed — GIWA is a single-version, single-chain
+--     deployment, so those discriminator columns do not exist here
 --   * 0015_v2_events.sql: only v2_sniping_history kept — the v2 fee tables
 --     (v2_fee_collect/settle/to_claim_history, v2_creator_fee_distribution)
 --     and v2_lp_allocate_history are NOT indexed by the GIWA 6-handler
@@ -290,8 +292,7 @@ CREATE TABLE IF NOT EXISTS token (
     transaction_hash VARCHAR NOT NULL,
     total_supply NUMERIC NOT NULL, -- token raw (wei): ERC20 raw supply (init 1e9 * 1e18), decremented by burns
 
-    token_holder_count BIGINT NOT NULL DEFAULT 0,
-    version VARCHAR NOT NULL DEFAULT 'V1' CHECK (version IN ('V1', 'V2'))
+    token_holder_count BIGINT NOT NULL DEFAULT 0
 );
 
 
@@ -311,7 +312,6 @@ CREATE INDEX IF NOT EXISTS idx_token_name ON token (name);
 CREATE INDEX IF NOT EXISTS idx_token_name_gin ON token USING GIN (name gin_trgm_ops);
 CREATE INDEX IF NOT EXISTS idx_token_symbol_gin ON token USING GIN (symbol gin_trgm_ops);  
 CREATE INDEX IF NOT EXISTS idx_token_token_id_lower ON token (LOWER(token_id));
-CREATE INDEX IF NOT EXISTS idx_token_version ON token (version);
 CREATE INDEX IF NOT EXISTS idx_token_is_nsfw ON token (is_nsfw);
 
 
@@ -4178,26 +4178,4 @@ CREATE INDEX IF NOT EXISTS idx_price_usd_token_block ON price_usd (token_id, blo
 
 ALTER TABLE whitelist_token
     ADD COLUMN IF NOT EXISTS price_source_id VARCHAR(42);
-
-
--- ============================================================================
--- >>> 0036_token_chain.sql
--- ============================================================================
-
-BEGIN;
-
-ALTER TABLE token
-    ADD COLUMN IF NOT EXISTS chain VARCHAR;
-
-UPDATE token
-SET chain = 'MON'
-WHERE chain IS NULL;
-
-ALTER TABLE token
-    ALTER COLUMN chain SET DEFAULT 'MON';
-
-ALTER TABLE token
-    ALTER COLUMN chain SET NOT NULL;
-
-COMMIT;
 
