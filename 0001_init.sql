@@ -5948,11 +5948,14 @@ CREATE INDEX IF NOT EXISTS idx_token_x_reservation_account_id
 
 -- Dev Post feature: coin-creator posts with images, polls, likes, votes.
 -- Design: docs/plans/2026-07-07-dev-post-api-design.md
--- pgactive: surrogate key via snowflake; all other tables use natural composite keys.
+-- Surrogate key via a plain sequence. The Monad deployment ran pgactive
+-- active-active and used pgactive.pgactive_snowflake_id_nextval() to keep ids
+-- unique across write nodes; GIWA is single-node, so nextval() suffices. Swap
+-- the default back if multi-master replication is ever introduced.
 CREATE SEQUENCE IF NOT EXISTS dev_post_snowflake_seq;
 
 CREATE TABLE IF NOT EXISTS dev_post (
-    id          BIGINT PRIMARY KEY DEFAULT pgactive.pgactive_snowflake_id_nextval('dev_post_snowflake_seq'),
+    id          BIGINT PRIMARY KEY DEFAULT nextval('dev_post_snowflake_seq'),
     token_id    VARCHAR(42) NOT NULL,
     author      VARCHAR(42) NOT NULL,
     body        TEXT        NOT NULL DEFAULT '',
