@@ -449,7 +449,7 @@ CREATE TABLE IF NOT EXISTS token_metadata(
 
 -- Market
 CREATE TABLE IF NOT EXISTS market (
-    market_type VARCHAR NOT NULL CHECK (market_type IN ('CURVE', 'DEX', 'V2_CURVE', 'V2_DEX')),
+    market_type VARCHAR NOT NULL CHECK (market_type IN ('CURVE', 'DEX')),
     token_id VARCHAR NOT NULL,
     pool_id VARCHAR NULL,
     reserve_quote NUMERIC NULL, --liquidity; quote raw (wei): raw on-chain reserve of the quote token
@@ -790,7 +790,7 @@ CREATE TABLE IF NOT EXISTS swap (
     account_id VARCHAR(42) NOT NULL,
     token_id VARCHAR(42) NOT NULL,
     -- market type
-    market_type VARCHAR NOT NULL CHECK (market_type IN ('CURVE', 'DEX', 'V2_CURVE', 'V2_DEX')),
+    market_type VARCHAR NOT NULL CHECK (market_type IN ('CURVE', 'DEX')),
     is_buy BOOLEAN NOT NULL,
     quote_amount NUMERIC NOT NULL,   -- UNIT: quote raw (wei) (buy=amount_in / sell=amount_out; observer src/event/v1/curve/receive.rs:431,530)
     token_amount NUMERIC NOT NULL,   -- UNIT: token raw (wei) (buy=amount_out / sell=amount_in; observer src/event/v1/curve/receive.rs:432,531)
