@@ -1,28 +1,4 @@
--- ============================================================================
--- 0001_init.sql — GIWA observer fresh-DB consolidated migration
---
--- Generated 2026-07-19 from giwa/observer migrations, concatenated in the
--- order the observer test harness applies them
--- (tests/common/mod.rs::apply_baseline_migrations), with GIWA-runtime pruning:
---
---   * numbered 0001..0035, excluding 1000_delete.sql; the pgactive-backed
---     0018_api_keys ID generator is replaced with a PostgreSQL identity column
---   * 0036_token_chain.sql is dropped and token.version is removed — GIWA is a
---     single-version, single-chain deployment, so those discriminators do not
---     exist here
---   * 0015 event schema: only sniping_history is retained; unused fee,
---     vault, and dividend event/aggregate tables are omitted.
---   * Monad-era upgrade/backfill tooling is dropped.
---   * API-only X verification and DevPost tables are omitted because those
---     product surfaces are not part of the GIWA API.
---
--- Naming: legacy version prefixes are absent from every table, index, trigger,
--- and function name because GIWA runs a single contract generation.
---
--- Target: fresh PostgreSQL 17 database for GIWA Sepolia indexing.
--- Quote defaults/seeds reference the GIWA WETH predeploy
--- 0x4200000000000000000000000000000000000006.
--- ============================================================================
+-- GIWA Observer fresh-database schema.
 
 CREATE EXTENSION IF NOT EXISTS pg_trgm;
 CREATE EXTENSION IF NOT EXISTS btree_gist;
@@ -45,19 +21,6 @@ CREATE TABLE IF NOT EXISTS account (
     follower_count INT NOT NULL DEFAULT 0,
     following_count INT NOT NULL DEFAULT 0
 );
-
--- Retained CMS analytics source, maintained by the swap trigger below.
-CREATE TABLE IF NOT EXISTS account_activity (
-    account_id VARCHAR(42) PRIMARY KEY,
-    first_swap_at BIGINT NOT NULL,
-    last_swap_at BIGINT NOT NULL,
-    total_swap_count BIGINT NOT NULL DEFAULT 0
-);
-
-CREATE INDEX IF NOT EXISTS idx_account_activity_first_swap
-    ON account_activity (first_swap_at);
-CREATE INDEX IF NOT EXISTS idx_account_activity_last_swap
-    ON account_activity (last_swap_at);
 
 -- API Search 모듈 최적화: nickname 검색 + follower_count 정렬을 위한 복합 인덱스  
 CREATE INDEX IF NOT EXISTS idx_account_nickname_follower ON account (nickname, follower_count DESC);
@@ -83,6 +46,13 @@ CREATE TABLE IF NOT EXISTS account_session (
 
 -- API Auth 모듈 최적화: session_id로 조회하는 쿼리용 인덱스
 CREATE INDEX IF NOT EXISTS idx_account_session_id ON account_session (id);
+
+-- API Search 모듈 최적화: Twitter 핸들 검색 시 account 테이블과의 JOIN 성능을 위한 인덱스
+
+
+-- Search 모듈 최적화: Twitter 핸들 gin_trgm_ops 조회하는 쿼리용 인덱스
+
+
 
 CREATE TABLE IF NOT EXISTS account_wallet(
     account_id VARCHAR(42) NOT NULL,
@@ -775,11 +745,11 @@ CREATE TABLE IF NOT EXISTS swap (
     -- market type
     market_type VARCHAR NOT NULL CHECK (market_type IN ('CURVE', 'DEX')),
     is_buy BOOLEAN NOT NULL,
-    quote_amount NUMERIC NOT NULL,   -- UNIT: quote raw (wei) (buy=amount_in / sell=amount_out)
-    token_amount NUMERIC NOT NULL,   -- UNIT: token raw (wei) (buy=amount_out / sell=amount_in)
-    reserve_quote NUMERIC NULL,   -- UNIT: quote raw (wei) (curve/pool quote reserve snapshot)
-    reserve_token NUMERIC NULL,   -- UNIT: token raw (wei) (curve/pool token reserve snapshot)
-    value NUMERIC NOT NULL DEFAULT 0,   -- UNIT: USD (human) ((quote_amount / 10^decimals) * USD-per-quote price)
+    quote_amount NUMERIC NOT NULL,   -- UNIT: quote raw (wei); buy amount_in or sell amount_out
+    token_amount NUMERIC NOT NULL,   -- UNIT: token raw (wei); buy amount_out or sell amount_in
+    reserve_quote NUMERIC NULL,   -- UNIT: quote raw (wei); curve/pool quote reserve snapshot
+    reserve_token NUMERIC NULL,   -- UNIT: token raw (wei); curve/pool token reserve snapshot
+    value NUMERIC NOT NULL DEFAULT 0,   -- UNIT: USD (human); quote_amount / 10^decimals * USD-per-quote price
     created_at BIGINT NOT NULL,
     transaction_hash VARCHAR NOT NULL,
     block_number BIGINT NOT NULL DEFAULT 0,
@@ -830,26 +800,6 @@ SET volume = COALESCE(
     ),
     0
 );
-
--- Maintain first/last swap timestamps for retained CMS analytics.
-CREATE OR REPLACE FUNCTION update_account_activity_on_swap()
-RETURNS TRIGGER AS $$
-BEGIN
-    INSERT INTO account_activity (account_id, first_swap_at, last_swap_at, total_swap_count)
-    VALUES (NEW.account_id, NEW.created_at, NEW.created_at, 1)
-    ON CONFLICT (account_id) DO UPDATE SET
-        last_swap_at = GREATEST(account_activity.last_swap_at, EXCLUDED.last_swap_at),
-        first_swap_at = LEAST(account_activity.first_swap_at, EXCLUDED.first_swap_at),
-        total_swap_count = account_activity.total_swap_count + 1;
-    RETURN NEW;
-END;
-$$ LANGUAGE plpgsql;
-
-DROP TRIGGER IF EXISTS trg_account_activity_on_swap ON swap;
-CREATE TRIGGER trg_account_activity_on_swap
-    AFTER INSERT ON swap
-    FOR EACH ROW
-    EXECUTE FUNCTION update_account_activity_on_swap();
 
 
 
@@ -970,10 +920,10 @@ CREATE TABLE IF NOT EXISTS mint(
     token_id VARCHAR(42) NOT NULL,
     account_id VARCHAR(42) NOT NULL,
     market_id VARCHAR(42) NOT NULL,
-    quote_amount NUMERIC NOT NULL,   -- UNIT: quote raw (wei) (decoded log amount)
-    token_amount NUMERIC NOT NULL,   -- UNIT: token raw (wei) (decoded log amount)
-    reserve_quote NUMERIC NOT NULL,   -- UNIT: quote raw (wei) (pool reserve snapshot)
-    reserve_token NUMERIC NOT NULL,   -- UNIT: token raw (wei) (pool reserve snapshot)
+    quote_amount NUMERIC NOT NULL,   -- UNIT: quote raw (wei); decoded log amount
+    token_amount NUMERIC NOT NULL,   -- UNIT: token raw (wei); decoded log amount
+    reserve_quote NUMERIC NOT NULL,   -- UNIT: quote raw (wei); pool reserve snapshot
+    reserve_token NUMERIC NOT NULL,   -- UNIT: token raw (wei); pool reserve snapshot
     created_at BIGINT NOT NULL,
     transaction_hash VARCHAR NOT NULL,
     block_number BIGINT NOT NULL,
@@ -989,10 +939,10 @@ CREATE TABLE IF NOT EXISTS burn(
     token_id VARCHAR(42) NOT NULL,
     account_id VARCHAR(42) NOT NULL,
     market_id VARCHAR(42) NOT NULL,
-    quote_amount NUMERIC NOT NULL,   -- UNIT: quote raw (wei) (decoded log amount)
-    token_amount NUMERIC NOT NULL,   -- UNIT: token raw (wei) (decoded log amount)
-    reserve_quote NUMERIC NOT NULL,   -- UNIT: quote raw (wei) (pool reserve snapshot)
-    reserve_token NUMERIC NOT NULL,   -- UNIT: token raw (wei) (pool reserve snapshot)
+    quote_amount NUMERIC NOT NULL,   -- UNIT: quote raw (wei); decoded log amount
+    token_amount NUMERIC NOT NULL,   -- UNIT: token raw (wei); decoded log amount
+    reserve_quote NUMERIC NOT NULL,   -- UNIT: quote raw (wei); pool reserve snapshot
+    reserve_token NUMERIC NOT NULL,   -- UNIT: token raw (wei); pool reserve snapshot
     created_at BIGINT NOT NULL,
     transaction_hash VARCHAR NOT NULL,
     block_number BIGINT NOT NULL,
@@ -1034,10 +984,8 @@ CREATE TABLE IF NOT EXISTS balance_history(
     PRIMARY KEY (token_id, account_id, transaction_hash,tx_index, log_index)
 );
 
--- Backfill / migration support: DISTINCT ON (account_id, token_id) ORDER BY
--- block_number DESC, tx_index DESC, log_index DESC is the canonical
--- "latest balance per (account, token)" query (used by the former trigger and
--- backfill upgrade). Without this index the sort spills
+-- DISTINCT ON (account_id, token_id) ordered by canonical log coordinates is
+-- the "latest balance per (account, token)" query. Without this index the sort spills
 -- to disk on production-size history tables.
 CREATE INDEX IF NOT EXISTS idx_balance_history_acct_token_block
     ON balance_history (account_id, token_id, block_number DESC, tx_index DESC, log_index DESC);
@@ -1281,6 +1229,13 @@ CREATE INDEX IF NOT EXISTS idx_fee_distribute_history_token ON fee_distribute_hi
 CREATE INDEX IF NOT EXISTS idx_fee_distribute_history_block ON fee_distribute_history(block_number);
 CREATE INDEX IF NOT EXISTS idx_fee_distribute_history_created_at ON fee_distribute_history(created_at);
 
+-- =====================================================
+-- Trigger: Update creator_treasury_balance from fee_distribute_history
+-- =====================================================
+
+-- 1. 트리거 함수 생성
+
+
 -- ============================================================================
 -- >>> 0007_price.sql
 -- ============================================================================
@@ -1288,7 +1243,7 @@ CREATE INDEX IF NOT EXISTS idx_fee_distribute_history_created_at ON fee_distribu
 -- Price table: multi-quote aware.
 -- Supports multiple quote tokens (WMON, USDC, etc.) via a composite
 -- primary key (quote_id, block_number). The default quote_id is the
--- GIWA WETH predeploy address, matching the legacy single-quote behavior.
+-- GIWA WETH predeploy address used as the default quote token.
 CREATE TABLE IF NOT EXISTS price (
     quote_id VARCHAR(42) NOT NULL DEFAULT '0x4200000000000000000000000000000000000006',
     block_number BIGINT NOT NULL,
@@ -1322,31 +1277,10 @@ CREATE TABLE IF NOT EXISTS admin(
 );
 
 -- ============================================================================
--- >>> 0012_fee.sql
--- ============================================================================
-
-CREATE TABLE IF NOT EXISTS set_fee_history(
-    pool_id VARCHAR(42) NOT NULL,
-    block_number BIGINT NOT NULL,
-    transaction_hash VARCHAR(66) NOT NULL,
-    tx_index INT NOT NULL,
-    log_index INT NOT NULL,
-    fee_protocol0_old SMALLINT NOT NULL,
-    fee_protocol1_old SMALLINT NOT NULL,
-    fee_protocol0_new SMALLINT NOT NULL,
-    fee_protocol1_new SMALLINT NOT NULL,
-    created_at BIGINT NOT NULL DEFAULT EXTRACT(EPOCH FROM CURRENT_TIMESTAMP)::BIGINT,
-    PRIMARY KEY (pool_id, block_number, transaction_hash, tx_index, log_index)
-);
-
-CREATE INDEX IF NOT EXISTS idx_set_fee_history_pool ON set_fee_history (pool_id);
-
-
--- ============================================================================
 -- >>> 0013_position.sql
 -- ============================================================================
 
--- Position: Transfer 기반 PnL 추적 (현금 흐름 기반)
+-- Transfer-based position and cash-flow tracking.
 -- 모든 케이스 커버: Buy, Sell, LP Mint, LP Burn, Transfer, Airdrop
 
 -- 1. 기존 트리거 및 함수 삭제
@@ -1587,11 +1521,14 @@ EXECUTE FUNCTION update_fee_on_history();
 -- >>> 0014_dex.sql
 -- ============================================================================
 
--- DEX infrastructure retained by the core market/trading APIs: pools and
--- liquidity mint/burn event history.
---
--- Consolidated from prior incremental pool/event migrations into the final
--- single-generation fresh-database schema.
+-- DEX infrastructure: pool pairs, external tokens,
+-- fee_config, raw event tables (dex_swap / dex_sync),
+-- and the statement-level update_pool_volume() trigger.
+
+-- GIN trigram indexes for /dex/search ILIKE substring acceleration.
+-- Requires the pg_trgm extension (already enabled in production per the
+-- existing idx_token_*_gin declarations in 0002_token.sql).
+-- Keep the canonical dex_token DDL and search indexes together.
 
 -- ---------------------------------------------------------------------------
 -- 2. Pool (DEX pairs — both graduated launchpad and pure DEX)
@@ -1624,66 +1561,8 @@ CREATE TABLE IF NOT EXISTS pool (
 CREATE INDEX IF NOT EXISTS idx_pool_token0 ON pool (token0);
 CREATE INDEX IF NOT EXISTS idx_pool_token1 ON pool (token1);
 
--- Idempotent ALTERs cover DBs created before volume/value joined the
--- canonical CREATE TABLE definition. Safe no-op on fresh DBs.
-ALTER TABLE pool
-    ADD COLUMN IF NOT EXISTS volume NUMERIC NOT NULL DEFAULT 0, -- USD (human); lifetime SUM(dex_swap.value)
-    ADD COLUMN IF NOT EXISTS value  NUMERIC NOT NULL DEFAULT 0, -- USD (human); current TVL snapshot
-    -- Per-token USD unit price. Nullable:
-    -- NULL = orphan token (no WMON-implied price) or not yet synced.
-    ADD COLUMN IF NOT EXISTS token0_price_usd NUMERIC, -- USD per token (token0)
-    ADD COLUMN IF NOT EXISTS token1_price_usd NUMERIC; -- USD per token (token1)
-
-CREATE TABLE IF NOT EXISTS dex_mint (
-    pool_id          VARCHAR(42) NOT NULL,
-    sender           VARCHAR(42) NOT NULL,
-    amount0          NUMERIC     NOT NULL, -- token raw (wei) of token0 added
-    amount1          NUMERIC     NOT NULL, -- token raw (wei) of token1 added
-    value            NUMERIC     NOT NULL DEFAULT 0, -- USD (human); token0_usd + token1_usd
-    token0_usd       NUMERIC     NOT NULL DEFAULT 0, -- USD (human); USD value of the token0 side
-    token1_usd       NUMERIC     NOT NULL DEFAULT 0, -- USD (human); USD value of the token1 side
-    created_at       BIGINT      NOT NULL, -- unix seconds (block timestamp)
-    block_number     BIGINT      NOT NULL,
-    transaction_hash VARCHAR     NOT NULL,
-    log_index        INTEGER     NOT NULL,
-    tx_index         INTEGER     NOT NULL,
-    PRIMARY KEY (pool_id, transaction_hash, tx_index, log_index)
-);
-CREATE INDEX IF NOT EXISTS idx_dex_mint_pool_block
-    ON dex_mint (pool_id, block_number DESC);
-
-CREATE TABLE IF NOT EXISTS dex_burn (
-    pool_id          VARCHAR(42) NOT NULL,
-    sender           VARCHAR(42) NOT NULL,
-    to_address       VARCHAR(42) NOT NULL,
-    amount0          NUMERIC     NOT NULL, -- token raw (wei) of token0 removed
-    amount1          NUMERIC     NOT NULL, -- token raw (wei) of token1 removed
-    value            NUMERIC     NOT NULL DEFAULT 0, -- USD (human); token0_usd + token1_usd
-    token0_usd       NUMERIC     NOT NULL DEFAULT 0, -- USD (human); USD value of the token0 side
-    token1_usd       NUMERIC     NOT NULL DEFAULT 0, -- USD (human); USD value of the token1 side
-    created_at       BIGINT      NOT NULL, -- unix seconds (block timestamp)
-    block_number     BIGINT      NOT NULL,
-    transaction_hash VARCHAR     NOT NULL,
-    log_index        INTEGER     NOT NULL,
-    tx_index         INTEGER     NOT NULL,
-    PRIMARY KEY (pool_id, transaction_hash, tx_index, log_index)
-);
-CREATE INDEX IF NOT EXISTS idx_dex_burn_pool_block
-    ON dex_burn (pool_id, block_number DESC);
-
--- Idempotent ALTERs cover DBs that ran an older revision of this file
--- where value / token0_usd / token1_usd were added in a follow-up.
-ALTER TABLE dex_mint
-    ADD COLUMN IF NOT EXISTS value      NUMERIC NOT NULL DEFAULT 0, -- USD (human); token0_usd + token1_usd
-    ADD COLUMN IF NOT EXISTS token0_usd NUMERIC NOT NULL DEFAULT 0, -- USD (human); token0 side
-    ADD COLUMN IF NOT EXISTS token1_usd NUMERIC NOT NULL DEFAULT 0; -- USD (human); token1 side
-ALTER TABLE dex_burn
-    ADD COLUMN IF NOT EXISTS value      NUMERIC NOT NULL DEFAULT 0, -- USD (human); token0_usd + token1_usd
-    ADD COLUMN IF NOT EXISTS token0_usd NUMERIC NOT NULL DEFAULT 0, -- USD (human); token0 side
-    ADD COLUMN IF NOT EXISTS token1_usd NUMERIC NOT NULL DEFAULT 0; -- USD (human); token1 side
-
 -- ---------------------------------------------------------------------------
--- pool.volume accumulator trigger
+-- 5. pool.volume accumulator trigger
 --
 -- Statement-level: a single batch INSERT fires the trigger once with the
 -- full new-rows view, so we GROUP BY pool_id and emit one UPDATE per pool
@@ -1697,15 +1576,17 @@ ALTER TABLE dex_burn
 
 
 -- ============================================================================
--- >>> 0015_events.sql (pruned: sniping_history only)
+-- >>> 0015_contract_events.sql
 -- ============================================================================
 
--- Single-generation event history populated from BondingCurve events.
+-- Contract event history tables populated from the active on-chain
+-- events: BondingCurve, LPManager, FeeCollector, CreatorFeeProcessor,
+-- BurnVault, GiftVault, LPVault, CreatorFeeVault.
 --
 -- All quote_id DEFAULTs are the GIWA WETH predeploy (chain-agnostic
 -- OP Stack address, valid on testnet and mainnet).
 
--- Sniping penalties (BondingCurve.SnipingFeeCollected)
+-- 1. Sniping Penalties (BondingCurve.SnipingFeeCollected)
 CREATE TABLE IF NOT EXISTS sniping_history (
     token_id VARCHAR(42) NOT NULL,
     buyer VARCHAR(42) NOT NULL,
@@ -1720,6 +1601,82 @@ CREATE TABLE IF NOT EXISTS sniping_history (
 );
 CREATE INDEX IF NOT EXISTS idx_sniping_history_token ON sniping_history (token_id);
 
+-- 3. Fee Collect History (FeeCollector.Collect)
+CREATE TABLE IF NOT EXISTS fee_collect_history (
+    token VARCHAR(42) NOT NULL,
+    pair VARCHAR(42) NOT NULL,
+    quote_id VARCHAR(42) NOT NULL DEFAULT '0x4200000000000000000000000000000000000006',
+    amount NUMERIC NOT NULL, -- quote raw (wei): FeeCollector.Collect.amount uint256 (fees denominated in quote_id)
+    transaction_hash VARCHAR NOT NULL,
+    block_number BIGINT NOT NULL,
+    created_at BIGINT NOT NULL, -- unix seconds (block timestamp)
+    log_index INT NOT NULL,
+    tx_index INT NOT NULL,
+    PRIMARY KEY (transaction_hash, tx_index, log_index)
+);
+CREATE INDEX IF NOT EXISTS idx_fee_collect_token ON fee_collect_history (token);
+CREATE INDEX IF NOT EXISTS idx_fee_collect_pair ON fee_collect_history (pair);
+
+-- 4. Fee Settle History (FeeCollector.Settle)
+CREATE TABLE IF NOT EXISTS fee_settle_history (
+    token VARCHAR(42) NOT NULL,
+    pair VARCHAR(42) NOT NULL,
+    quote_id VARCHAR(42) NOT NULL DEFAULT '0x4200000000000000000000000000000000000006',
+    total_fee NUMERIC NOT NULL, -- quote raw (wei): FeeCollector.Settle.totalFee uint256 (fees denominated in quote_id)
+    creator_fee NUMERIC NOT NULL, -- quote raw (wei): FeeCollector.Settle.creatorFee uint256 (fees denominated in quote_id)
+    transaction_hash VARCHAR NOT NULL,
+    block_number BIGINT NOT NULL,
+    created_at BIGINT NOT NULL, -- unix seconds (block timestamp)
+    log_index INT NOT NULL,
+    tx_index INT NOT NULL,
+    PRIMARY KEY (transaction_hash, tx_index, log_index)
+);
+CREATE INDEX IF NOT EXISTS idx_fee_settle_token ON fee_settle_history (token);
+CREATE INDEX IF NOT EXISTS idx_fee_settle_pair ON fee_settle_history (pair);
+
+-- 5. Creator Fee Distribution (CreatorFeeProcessor.Distribute / CallbackFail)
+CREATE TABLE IF NOT EXISTS creator_fee_distribution (
+    event_type VARCHAR NOT NULL,
+    token VARCHAR(42),
+    quote_id VARCHAR(42) NOT NULL DEFAULT '0x4200000000000000000000000000000000000006',
+    vault VARCHAR(42),
+    amount NUMERIC NOT NULL, -- quote raw (wei): CreatorFeeProcessor.Distribute.amount uint256 (denominated in quote_id; usd_enrich.rs divides by quote decimals)
+    usd_value NUMERIC NOT NULL DEFAULT 0, -- USD (human): amount/10^quote_decimals * quote USD price (usd_enrich.rs)
+    reason BYTEA,
+    transaction_hash VARCHAR NOT NULL,
+    block_number BIGINT NOT NULL,
+    created_at BIGINT NOT NULL, -- unix seconds (block timestamp)
+    log_index INT NOT NULL,
+    tx_index INT NOT NULL,
+    PRIMARY KEY (transaction_hash, tx_index, log_index)
+);
+CREATE INDEX IF NOT EXISTS idx_creator_fee_dist_token ON creator_fee_distribution (token);
+
+
+-- Vault event logs, registry, metadata, aggregates, and triggers are defined
+-- together in the vault section below.
+
+-- 6. FeeTo Claim History (FeeTo.Claimed)
+-- Each row = one successful claim() call on FeeTo. quoteIn fixed at ~1 MON
+-- by txbot; quoteOut = excess routed to feeReceiver.
+CREATE TABLE IF NOT EXISTS fee_to_claim_history (
+    token VARCHAR(42) NOT NULL,
+    pair VARCHAR(42) NOT NULL,
+    quote_id VARCHAR(42) NOT NULL DEFAULT '0x4200000000000000000000000000000000000006',
+    quote_in NUMERIC NOT NULL, -- quote raw (wei): FeeTo.Claimed.quoteIn uint256
+    quote_out NUMERIC NOT NULL, -- quote raw (wei): FeeTo.Claimed.quoteOut uint256 (excess routed to feeReceiver)
+    transaction_hash VARCHAR NOT NULL,
+    block_number BIGINT NOT NULL,
+    created_at BIGINT NOT NULL, -- unix seconds (block timestamp)
+    log_index INT NOT NULL,
+    tx_index INT NOT NULL,
+    PRIMARY KEY (transaction_hash, tx_index, log_index)
+);
+CREATE INDEX IF NOT EXISTS idx_fee_to_claim_token ON fee_to_claim_history (token);
+CREATE INDEX IF NOT EXISTS idx_fee_to_claim_pair_created ON fee_to_claim_history (pair, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_fee_to_claim_created ON fee_to_claim_history (created_at DESC);
+
+-- ============================================================================
 -- >>> 0016_pnl_aggregator.sql
 -- ============================================================================
 
@@ -1771,914 +1728,98 @@ VALUES (
     'https://storage.nadapp.net/quote/weth.webp'
 ) ON CONFLICT (quote_id) DO NOTHING;
 
+ALTER TABLE quote_token
+    ADD COLUMN IF NOT EXISTS price_usd_source_id VARCHAR(42);
 
--- ============================================================================
--- >>> 0021_lp_position.sql
--- ============================================================================
+UPDATE quote_token
+SET price_usd_source_id = '0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2'
+WHERE LOWER(quote_id) = LOWER('0x4200000000000000000000000000000000000006')
+  AND price_usd_source_id IS NULL;
 
--- LP position tracking for NadFunPair (position pattern)
--- Mirrors migrations/0013_position.sql conventions
--- See the historical LP-position design for derivation details.
---
--- Consolidated from 0021 (tables + triggers) and the former 0029
--- (lp_position_cost_basis view + one-time backfill) into one canonical
--- file. The view appears at the tail of this file because it joins against
--- dex_mint / dex_burn (created in 0014_dex.sql) — fresh-DB load order
--- 0014 → 0021 guarantees those tables exist by view-creation time.
---
--- ⚠️ If you edit the fill_lp_cost_basis() / apply_lp_position() /
--- refresh_lp_position_cost_basis() function bodies OR the view body,
--- mirror the change in the former LP-position upgrade migration.
---
--- Schema includes USD value columns (cost-basis, frozen at deposit/transfer
--- time). USD is filled by `fill_lp_cost_basis` from dex_mint/dex_burn (mint,
--- burn events) or pro-rated from the sender's running lp_position (transfer).
--- Current market value is the API layer's job
--- (balance × pool.value / pool.total_supply).
---
--- Note: `lp_event_type` is the first project-level ENUM. `position_history.transfer_type`
--- in 0013 stayed VARCHAR(20) — no precedent. We choose ENUM here for type safety
--- and storage efficiency on a high-volume event log.
-
--- Event type enum for lp_position_history
-CREATE TYPE lp_event_type AS ENUM ('mint', 'burn', 'transfer_in', 'transfer_out');
-
-CREATE TABLE IF NOT EXISTS lp_position_history (
-    account_id       VARCHAR(42) NOT NULL,
-    pool_id          VARCHAR(42) NOT NULL,
-
-    lp_in            NUMERIC NOT NULL DEFAULT 0, -- LP shares (raw); chain Transfer.value on LP token
-    lp_out           NUMERIC NOT NULL DEFAULT 0, -- LP shares (raw); chain Transfer.value on LP token
-    token0_in        NUMERIC NOT NULL DEFAULT 0, -- token0 raw (wei); share-weighted from dex_mint.amount0
-    token0_out       NUMERIC NOT NULL DEFAULT 0, -- token0 raw (wei); from dex_burn.amount0
-    token1_in        NUMERIC NOT NULL DEFAULT 0, -- token1 raw (wei); share-weighted from dex_mint.amount1
-    token1_out       NUMERIC NOT NULL DEFAULT 0, -- token1 raw (wei); from dex_burn.amount1
-
-    -- Cost-basis USD value, frozen at the event's block time.
-    lp_in_usd        NUMERIC NOT NULL DEFAULT 0, -- USD (human); share-weighted from dex_mint.value
-    lp_out_usd       NUMERIC NOT NULL DEFAULT 0, -- USD (human); from dex_burn.value
-    token0_in_usd    NUMERIC NOT NULL DEFAULT 0, -- USD (human); share-weighted from dex_mint.token0_usd
-    token0_out_usd   NUMERIC NOT NULL DEFAULT 0, -- USD (human); from dex_burn.token0_usd
-    token1_in_usd    NUMERIC NOT NULL DEFAULT 0, -- USD (human); share-weighted from dex_mint.token1_usd
-    token1_out_usd   NUMERIC NOT NULL DEFAULT 0, -- USD (human); from dex_burn.token1_usd
-
-    event_type       lp_event_type NOT NULL,
-    counterparty     VARCHAR(42),
-
-    transaction_hash VARCHAR(66) NOT NULL,
-    block_number     BIGINT NOT NULL,
-    tx_index         INT NOT NULL,
-    log_index        INT NOT NULL,
-    created_at       BIGINT NOT NULL DEFAULT EXTRACT(EPOCH FROM CURRENT_TIMESTAMP)::BIGINT,
-
-    PRIMARY KEY (account_id, pool_id, transaction_hash, tx_index, log_index)
+CREATE TABLE IF NOT EXISTS price_usd (
+    token_id VARCHAR(42) NOT NULL,
+    block_number BIGINT NOT NULL,
+    price NUMERIC NOT NULL,
+    confidence NUMERIC,
+    created_at BIGINT NOT NULL,
+    PRIMARY KEY (token_id, block_number)
 );
 
--- Idempotent USD-column adds for any DB that ran an older rev of this file
--- (pre-USD shape). Safe no-op on fresh DBs.
-ALTER TABLE lp_position_history
-    ADD COLUMN IF NOT EXISTS lp_in_usd      NUMERIC NOT NULL DEFAULT 0, -- USD (human)
-    ADD COLUMN IF NOT EXISTS lp_out_usd     NUMERIC NOT NULL DEFAULT 0, -- USD (human)
-    ADD COLUMN IF NOT EXISTS token0_in_usd  NUMERIC NOT NULL DEFAULT 0, -- USD (human)
-    ADD COLUMN IF NOT EXISTS token0_out_usd NUMERIC NOT NULL DEFAULT 0, -- USD (human)
-    ADD COLUMN IF NOT EXISTS token1_in_usd  NUMERIC NOT NULL DEFAULT 0, -- USD (human)
-    ADD COLUMN IF NOT EXISTS token1_out_usd NUMERIC NOT NULL DEFAULT 0; -- USD (human)
+CREATE INDEX IF NOT EXISTS idx_price_usd_token_block
+    ON price_usd (token_id, block_number DESC);
 
-CREATE INDEX IF NOT EXISTS idx_lp_position_history_account ON lp_position_history(account_id);
-CREATE INDEX IF NOT EXISTS idx_lp_position_history_pool    ON lp_position_history(pool_id);
-CREATE INDEX IF NOT EXISTS idx_lp_position_history_tx      ON lp_position_history(transaction_hash);
-CREATE INDEX IF NOT EXISTS idx_lp_position_history_block   ON lp_position_history(block_number, tx_index, log_index);
-CREATE INDEX IF NOT EXISTS idx_lp_position_history_event   ON lp_position_history(event_type);
 
-CREATE TABLE IF NOT EXISTS lp_position (
-    account_id     VARCHAR(42) NOT NULL,
-    pool_id        VARCHAR(42) NOT NULL,
-    lp_in          NUMERIC NOT NULL DEFAULT 0, -- LP shares (raw); SUM of mint/transfer-in Transfer.value
-    lp_out         NUMERIC NOT NULL DEFAULT 0, -- LP shares (raw); SUM of burn/transfer-out Transfer.value
-    -- Running open balance for this (account, pool) epoch. Maintained
-    -- automatically by PostgreSQL; no trigger logic touches it. Consumers
-    -- can `SELECT balance` directly instead of computing lp_in - lp_out and
-    -- can index/sort by it.
-    balance        NUMERIC GENERATED ALWAYS AS (lp_in - lp_out) STORED, -- LP shares (raw); open balance = lp_in - lp_out
-    token0_in      NUMERIC NOT NULL DEFAULT 0, -- token0 raw (wei); epoch SUM from history
-    token0_out     NUMERIC NOT NULL DEFAULT 0, -- token0 raw (wei); epoch SUM from history
-    token1_in      NUMERIC NOT NULL DEFAULT 0, -- token1 raw (wei); epoch SUM from history
-    token1_out     NUMERIC NOT NULL DEFAULT 0, -- token1 raw (wei); epoch SUM from history
-    lp_in_usd      NUMERIC NOT NULL DEFAULT 0, -- USD (human); epoch SUM from history
-    lp_out_usd     NUMERIC NOT NULL DEFAULT 0, -- USD (human); epoch SUM from history
-    token0_in_usd  NUMERIC NOT NULL DEFAULT 0, -- USD (human); epoch SUM from history
-    token0_out_usd NUMERIC NOT NULL DEFAULT 0, -- USD (human); epoch SUM from history
-    token1_in_usd  NUMERIC NOT NULL DEFAULT 0, -- USD (human); epoch SUM from history
-    token1_out_usd NUMERIC NOT NULL DEFAULT 0, -- USD (human); epoch SUM from history
-    created_at     BIGINT NOT NULL,
-    updated_at     BIGINT NOT NULL,
-    PRIMARY KEY (account_id, pool_id)
+-- ============================================================================
+-- >>> 0020_gift_tweet.sql
+-- ============================================================================
+
+-- =====================================================
+-- gift_tweet: producer(트윗 스트림)와 consumer(on-chain setReceiver)
+-- 사이의 크래시 안전 버퍼. 추가로 consumer가 setReceiver 성공 직후
+-- 프로필 링크로 답글을 다는 reply 워크플로 상태도 같이 보관.
+--
+-- 설계 문서: gift-bot/docs/plans/2026-04-24-split-architecture-design.md
+--
+-- Reply 상태머신 (reply_status):
+--   none      — reply 기능 비활성/이 row는 reply 대상 아님
+--   pending   — setReceiver 성공, reply 워커가 처리 대기
+--   sent      — POST /2/tweets 성공, reply_tweet_id에 답글 id 저장
+--   failed    — 최대 재시도 횟수 초과 / 비재시도 오류 (operator 액션 필요)
+-- =====================================================
+
+CREATE TABLE IF NOT EXISTS gift_tweet (
+    tweet_id         VARCHAR(32)  PRIMARY KEY,                 -- X snowflake id
+    token_id         VARCHAR(42)  NOT NULL,                    -- 0x... token contract
+    receiver_id      VARCHAR(42)  NOT NULL,                    -- 0x... resolved EVM receiver
+    handle           VARCHAR(16)  NOT NULL,                    -- tweet 작성자 X handle (@ 제외)
+
+    status           VARCHAR(16)  NOT NULL DEFAULT 'pending'
+                     CHECK (status IN ('pending','submitted','completed','rejected')),
+    reject_reason    VARCHAR(32),                              -- ValidationReject variant name
+    tx_hash          VARCHAR(66),                              -- submitted → completed 전이 시 기록
+    last_error       TEXT,                                     -- transient 실패 최근 원인
+
+    -- Reply-on-success 워크플로 (consumer가 setReceiver 성공 후 X에 답글)
+    reply_status     VARCHAR(16)  NOT NULL DEFAULT 'none'
+                     CHECK (reply_status IN ('none','pending','sent','failed')),
+    reply_tweet_id   VARCHAR(32),                              -- X가 반환한 답글의 snowflake id
+    reply_attempts   INT          NOT NULL DEFAULT 0,          -- 재시도 카운터
+    reply_last_error TEXT,                                     -- 최근 reply 실패 사유
+    reply_sent_at    TIMESTAMPTZ,                              -- 답글 성공 timestamp
+
+    received_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    updated_at       TIMESTAMPTZ  NOT NULL DEFAULT NOW()
 );
 
-ALTER TABLE lp_position
-    ADD COLUMN IF NOT EXISTS lp_in_usd            NUMERIC NOT NULL DEFAULT 0, -- USD (human)
-    ADD COLUMN IF NOT EXISTS lp_out_usd           NUMERIC NOT NULL DEFAULT 0, -- USD (human)
-    ADD COLUMN IF NOT EXISTS token0_in_usd        NUMERIC NOT NULL DEFAULT 0, -- USD (human)
-    ADD COLUMN IF NOT EXISTS token0_out_usd       NUMERIC NOT NULL DEFAULT 0, -- USD (human)
-    ADD COLUMN IF NOT EXISTS token1_in_usd        NUMERIC NOT NULL DEFAULT 0, -- USD (human)
-    ADD COLUMN IF NOT EXISTS token1_out_usd       NUMERIC NOT NULL DEFAULT 0, -- USD (human)
-    -- Epoch boundary: lp_position rows are deleted on full exit and re-INSERTed
-    -- on re-entry, so each row represents one continuous open epoch. Track the
-    -- (block, tx_index, log_index) of the row's first event so the materialize
-    -- trigger's SUM-from-history sums only THIS epoch and doesn't resurrect
-    -- cost basis from closed past epochs.
-    ADD COLUMN IF NOT EXISTS epoch_start_block     BIGINT NOT NULL DEFAULT 0,
-    ADD COLUMN IF NOT EXISTS epoch_start_tx_index  INT    NOT NULL DEFAULT 0,
-    ADD COLUMN IF NOT EXISTS epoch_start_log_index INT    NOT NULL DEFAULT 0,
-    -- Generated stored open-balance column. Auto-recomputed by PG on every
-    -- UPDATE of lp_in/lp_out via apply_lp_position(); no trigger maintenance.
-    ADD COLUMN IF NOT EXISTS balance               NUMERIC GENERATED ALWAYS AS (lp_in - lp_out) STORED; -- LP shares (raw); open balance = lp_in - lp_out
+-- pending 큐 폴링 최적화 (보통의 work queue)
+CREATE INDEX IF NOT EXISTS idx_gift_tweet_pending
+    ON gift_tweet (received_at)
+    WHERE status = 'pending';
 
-CREATE INDEX IF NOT EXISTS idx_lp_position_account ON lp_position(account_id);
-CREATE INDEX IF NOT EXISTS idx_lp_position_pool    ON lp_position(pool_id);
+-- submitted 스윕 최적화 (재시작 시 on-chain reconciliation)
+CREATE INDEX IF NOT EXISTS idx_gift_tweet_submitted
+    ON gift_tweet (received_at)
+    WHERE status = 'submitted';
 
-ALTER TABLE pool ADD COLUMN IF NOT EXISTS total_supply NUMERIC(78,0) NOT NULL DEFAULT 0; -- LP shares (raw); running pool LP supply (Σ mint lp_in − Σ burn lp_out)
+-- Reply 워커 폴링 최적화: 'pending'만 인덱싱 (partial index라
+-- sent/failed/none이 누적돼도 인덱스가 부풀지 않음)
+CREATE INDEX IF NOT EXISTS idx_gift_tweet_reply_pending
+    ON gift_tweet (updated_at)
+    WHERE reply_status = 'pending';
 
--- BEFORE INSERT: balance bookkeeping only. Cost basis lives in the
--- lp_position_cost_basis view defined below.
---
--- Responsibilities preserved from the previous revision:
---   * burn rows: re-attribute account_id to dex_burn.to_address (the Transfer
---     log's from-field is the pair contract, not the user).
---   * transfer rows where counterparty=pool: drop (Pair.burn() emits a
---     pool↔user Transfer leg that should be folded into the matching burn).
---
--- Removed responsibilities (now derived in lp_position_cost_basis view):
---   * Filling token0_in/token1_in/USD on mint (share-weighted in the view).
---   * Filling token0_out/token1_out/USD on burn (single-recipient in the view).
---   * Pro-rating transfer cost basis from the sender's running lp_position
---     (out of scope; defer until a consumer needs running per-holder cost
---     basis after transfers).
-CREATE OR REPLACE FUNCTION fill_lp_cost_basis()
-RETURNS TRIGGER AS $$
-DECLARE
-    burn_row RECORD;
+-- INSERT 시 consumer에게 신호 (트랜잭션 커밋 후 발송됨)
+CREATE OR REPLACE FUNCTION notify_gift_tweet_new() RETURNS trigger AS $$
 BEGIN
-    IF NEW.event_type = 'burn' THEN
-        SELECT * INTO burn_row
-          FROM dex_burn
-         WHERE pool_id = NEW.pool_id
-           AND transaction_hash = NEW.transaction_hash
-           AND log_index > NEW.log_index
-         ORDER BY log_index ASC LIMIT 1;
-        IF FOUND THEN
-            NEW.account_id := burn_row.to_address;
-        ELSE
-            RAISE WARNING 'LP burn without matching dex_burn: pool=% tx=% (attributed to %)',
-                NEW.pool_id, NEW.transaction_hash, NEW.account_id;
-        END IF;
-
-    ELSIF NEW.event_type = 'transfer_out' THEN
-        -- Drop the user→pair leg of burn(); the burn row that follows in the
-        -- same tx (re-attributed above) carries the user's lp_out.
-        IF NEW.counterparty = NEW.pool_id THEN
-            RETURN NULL;
-        END IF;
-
-    ELSIF NEW.event_type = 'transfer_in' THEN
-        -- Drop the pair-receives-LP phantom row (first leg of burn).
-        IF NEW.account_id = NEW.pool_id THEN
-            RETURN NULL;
-        END IF;
-    END IF;
-
+    PERFORM pg_notify('gift_tweet_new', NEW.tweet_id);
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
 
--- AFTER INSERT: aggregate lp balance + pool.total_supply only. Token/USD
--- accumulation removed — those columns stay at 0 on lp_position and consumers
--- read cost basis from the lp_position_cost_basis view.
--- Does NOT fire when ON CONFLICT DO NOTHING skips.
-CREATE OR REPLACE FUNCTION apply_lp_position()
-RETURNS TRIGGER AS $$
-BEGIN
-    IF NEW.event_type = 'mint' THEN
-        UPDATE pool SET total_supply = total_supply + NEW.lp_in WHERE pool_id = NEW.pool_id;
-    ELSIF NEW.event_type = 'burn' THEN
-        UPDATE pool SET total_supply = total_supply - NEW.lp_out WHERE pool_id = NEW.pool_id;
-    END IF;
-
-    INSERT INTO lp_position (account_id, pool_id, lp_in, lp_out, created_at, updated_at,
-                             epoch_start_block, epoch_start_tx_index, epoch_start_log_index)
-    VALUES (NEW.account_id, NEW.pool_id, NEW.lp_in, NEW.lp_out, NEW.created_at, NEW.created_at,
-            NEW.block_number, NEW.tx_index, NEW.log_index)
-    ON CONFLICT (account_id, pool_id) DO UPDATE SET
-        lp_in      = lp_position.lp_in  + EXCLUDED.lp_in,
-        lp_out     = lp_position.lp_out + EXCLUDED.lp_out,
-        updated_at = EXCLUDED.updated_at;
-    -- epoch_start_* are intentionally NOT in the SET list — they're set
-    -- only on fresh INSERT (= start of a new epoch) and preserved across
-    -- subsequent UPSERTs until the row is DELETEd by full-exit below.
-
-    DELETE FROM lp_position
-     WHERE account_id = NEW.account_id
-       AND pool_id    = NEW.pool_id
-       AND lp_in      = lp_out;
-
-    RETURN NULL;
-END;
-$$ LANGUAGE plpgsql;
-
--- AFTER STATEMENT: materialize the lp_position_cost_basis view definition into
--- both lp_position_history (per-row token/USD cols) and lp_position (aggregate
--- token/USD cols) for the (pool_id, transaction_hash) tuples touched in this
--- INSERT batch. Fires once per INSERT statement (sees the whole batch via the
--- NEW transition table), so share-weighted attribution is correct regardless of
--- batch row order.
---
--- Ordering invariant: the DEX stream completes before the Token stream, so dex_mint
--- and dex_burn rows are already in the DB when this fires. If a row's matching
--- dex_mint/dex_burn is missing (= invariant broken), RAISE WARNING and leave
--- token cols at 0 — never silently mis-attribute.
-CREATE OR REPLACE FUNCTION refresh_lp_position_cost_basis()
-RETURNS TRIGGER AS $$
-DECLARE
-    feeto CONSTANT TEXT := '0x715103eeeac12fb84f5d3b35c3268dd767fa8b8a';
-BEGIN
-    -- (1) MINT side: re-fill lp_position_history.token cols for every mint row
-    -- in (pool_id, transaction_hash) tuples touched by this batch.
-    -- Uses the same share-weighted math as the lp_position_cost_basis view.
-    WITH affected_mint_txs AS (
-        SELECT DISTINCT pool_id, transaction_hash
-          FROM new_rows
-         WHERE event_type = 'mint'
-    ),
-    mint_with_dm AS (
-        SELECT
-            ph.account_id, ph.pool_id, ph.transaction_hash, ph.tx_index, ph.log_index,
-            ph.lp_in,
-            dm.amount0    AS dm_amount0,
-            dm.amount1    AS dm_amount1,
-            dm.value      AS dm_value,
-            dm.token0_usd AS dm_token0_usd,
-            dm.token1_usd AS dm_token1_usd,
-            dm.log_index  AS dm_log_index
-          FROM lp_position_history ph
-          JOIN affected_mint_txs a
-            ON a.pool_id = ph.pool_id AND a.transaction_hash = ph.transaction_hash
-          JOIN LATERAL (
-              SELECT *
-                FROM dex_mint
-               WHERE pool_id = ph.pool_id
-                 AND transaction_hash = ph.transaction_hash
-                 AND log_index > ph.log_index
-               ORDER BY log_index ASC LIMIT 1
-          ) dm ON true
-         WHERE ph.event_type = 'mint'
-    ),
-    mint_truncs AS (
-        SELECT
-            ph.account_id, ph.pool_id, ph.transaction_hash, ph.tx_index, ph.log_index,
-            ph.lp_in, ph.dm_amount0, ph.dm_amount1, ph.dm_value,
-            ph.dm_token0_usd, ph.dm_token1_usd, ph.dm_log_index, r.real_lp,
-            CASE WHEN LOWER(ph.account_id) = feeto THEN 0
-                 ELSE TRUNC(ph.lp_in * ph.dm_amount0 / NULLIF(r.real_lp, 0))
-            END AS t0_trunc,
-            CASE WHEN LOWER(ph.account_id) = feeto THEN 0
-                 ELSE TRUNC(ph.lp_in * ph.dm_amount1 / NULLIF(r.real_lp, 0))
-            END AS t1_trunc,
-            ROW_NUMBER() OVER (
-                PARTITION BY ph.pool_id, ph.transaction_hash, ph.dm_log_index
-                ORDER BY
-                    CASE WHEN LOWER(ph.account_id) = feeto THEN 1 ELSE 0 END,
-                    ph.lp_in DESC,
-                    ph.log_index ASC
-            ) AS anchor_rn
-          FROM mint_with_dm ph
-          JOIN LATERAL (
-              SELECT COALESCE(SUM(sib.lp_in), 0) AS real_lp
-                FROM mint_with_dm sib
-               WHERE sib.pool_id = ph.pool_id
-                 AND sib.transaction_hash = ph.transaction_hash
-                 AND sib.dm_log_index = ph.dm_log_index
-                 AND LOWER(sib.account_id) <> feeto
-          ) r ON true
-    ),
-    mint_costs AS (
-        SELECT
-            mt.account_id, mt.pool_id, mt.transaction_hash, mt.tx_index, mt.log_index,
-            -- Residual sum partition MUST match the anchor partition (per
-            -- dex_mint, not per tx). A router-aggregated tx with multiple
-            -- dex_mints carries independent residuals.
-            CASE WHEN LOWER(mt.account_id) = feeto THEN 0
-                 WHEN mt.anchor_rn = 1
-                     THEN mt.t0_trunc + (mt.dm_amount0 - SUM(mt.t0_trunc) OVER (
-                            PARTITION BY mt.pool_id, mt.transaction_hash, mt.dm_log_index))
-                 ELSE mt.t0_trunc
-            END AS token0_in,
-            CASE WHEN LOWER(mt.account_id) = feeto THEN 0
-                 WHEN mt.anchor_rn = 1
-                     THEN mt.t1_trunc + (mt.dm_amount1 - SUM(mt.t1_trunc) OVER (
-                            PARTITION BY mt.pool_id, mt.transaction_hash, mt.dm_log_index))
-                 ELSE mt.t1_trunc
-            END AS token1_in,
-            CASE WHEN LOWER(mt.account_id) = feeto THEN 0
-                 ELSE ROUND(mt.lp_in * COALESCE(mt.dm_token0_usd, 0) / NULLIF(mt.real_lp, 0), 10)
-            END AS token0_in_usd,
-            CASE WHEN LOWER(mt.account_id) = feeto THEN 0
-                 ELSE ROUND(mt.lp_in * COALESCE(mt.dm_token1_usd, 0) / NULLIF(mt.real_lp, 0), 10)
-            END AS token1_in_usd,
-            CASE WHEN LOWER(mt.account_id) = feeto THEN 0
-                 ELSE ROUND(mt.lp_in * COALESCE(mt.dm_value, 0) / NULLIF(mt.real_lp, 0), 10)
-            END AS lp_in_usd
-          FROM mint_truncs mt
-    )
-    UPDATE lp_position_history h
-       SET token0_in     = c.token0_in,
-           token1_in     = c.token1_in,
-           token0_in_usd = c.token0_in_usd,
-           token1_in_usd = c.token1_in_usd,
-           lp_in_usd     = c.lp_in_usd
-      FROM mint_costs c
-     WHERE h.account_id       = c.account_id
-       AND h.pool_id          = c.pool_id
-       AND h.transaction_hash = c.transaction_hash
-       AND h.tx_index         = c.tx_index
-       AND h.log_index        = c.log_index;
-
-    -- (2) BURN side: re-fill lp_position_history.token cols for burn rows
-    -- in (pool_id, transaction_hash) tuples touched by this batch.
-    WITH affected_burn_txs AS (
-        SELECT DISTINCT pool_id, transaction_hash
-          FROM new_rows
-         WHERE event_type = 'burn'
-    ),
-    burn_costs AS (
-        SELECT
-            ph.account_id, ph.pool_id, ph.transaction_hash, ph.tx_index, ph.log_index,
-            db.amount0    AS token0_out,
-            db.amount1    AS token1_out,
-            ROUND(COALESCE(db.token0_usd, 0), 10) AS token0_out_usd,
-            ROUND(COALESCE(db.token1_usd, 0), 10) AS token1_out_usd,
-            ROUND(COALESCE(db.value,      0), 10) AS lp_out_usd
-          FROM lp_position_history ph
-          JOIN affected_burn_txs a
-            ON a.pool_id = ph.pool_id AND a.transaction_hash = ph.transaction_hash
-          JOIN LATERAL (
-              SELECT *
-                FROM dex_burn
-               WHERE pool_id = ph.pool_id
-                 AND transaction_hash = ph.transaction_hash
-                 AND log_index > ph.log_index
-               ORDER BY log_index ASC LIMIT 1
-          ) db ON true
-         WHERE ph.event_type = 'burn'
-    )
-    UPDATE lp_position_history h
-       SET token0_out     = c.token0_out,
-           token1_out     = c.token1_out,
-           token0_out_usd = c.token0_out_usd,
-           token1_out_usd = c.token1_out_usd,
-           lp_out_usd     = c.lp_out_usd
-      FROM burn_costs c
-     WHERE h.account_id       = c.account_id
-       AND h.pool_id          = c.pool_id
-       AND h.transaction_hash = c.transaction_hash
-       AND h.tx_index         = c.tx_index
-       AND h.log_index        = c.log_index;
-
-    -- (3) WARNING for rows that landed without a matching dex_mint or dex_burn
-    -- (= ordering invariant broken: the DEX stream should have finished first).
-    -- Aggregate the offending (pool, tx) pairs into the message (capped to 5
-    -- for bounded log line length) so operators can correlate immediately.
-    DECLARE
-        missing_pairs TEXT;
-    BEGIN
-        SELECT string_agg(
-                   format('pool=%s tx=%s', n.pool_id, n.transaction_hash),
-                   ', '
-                   ORDER BY n.pool_id, n.transaction_hash
-               )
-          INTO missing_pairs
-          FROM (
-              SELECT DISTINCT n.pool_id, n.transaction_hash
-                FROM new_rows n
-               WHERE n.event_type = 'mint'
-                 AND NOT EXISTS (SELECT 1 FROM dex_mint dm
-                                  WHERE dm.pool_id = n.pool_id
-                                    AND dm.transaction_hash = n.transaction_hash
-                                    AND dm.log_index > n.log_index)
-               LIMIT 5
-          ) n;
-        IF missing_pairs IS NOT NULL THEN
-            RAISE WARNING 'LP mint without matching dex_mint — ordering invariant broken; offending pairs (first 5): %', missing_pairs;
-        END IF;
-
-        SELECT string_agg(
-                   format('pool=%s tx=%s', n.pool_id, n.transaction_hash),
-                   ', '
-                   ORDER BY n.pool_id, n.transaction_hash
-               )
-          INTO missing_pairs
-          FROM (
-              SELECT DISTINCT n.pool_id, n.transaction_hash
-                FROM new_rows n
-               WHERE n.event_type = 'burn'
-                 AND NOT EXISTS (SELECT 1 FROM dex_burn db
-                                  WHERE db.pool_id = n.pool_id
-                                    AND db.transaction_hash = n.transaction_hash
-                                    AND db.log_index > n.log_index)
-               LIMIT 5
-          ) n;
-        IF missing_pairs IS NOT NULL THEN
-            RAISE WARNING 'LP burn without matching dex_burn — ordering invariant broken; offending pairs (first 5): %', missing_pairs;
-        END IF;
-    END;
-
-    -- (4) Aggregate rebuild: for each (account_id, pool_id) touched by this
-    -- batch, recompute lp_position.token* / *_usd absolutely from history.
-    -- lp_in / lp_out are NOT touched here — they're maintained by the existing
-    -- apply_lp_position() per-row UPSERT. This trigger only owns cost basis.
-    WITH affected_pairs AS (
-        SELECT DISTINCT account_id, pool_id FROM new_rows
-        UNION
-        -- The UNION is load-bearing for SHARE-WEIGHTING RECOMPUTATION across
-        -- statements: when a later batch inserts a new mint row into a tx
-        -- that already had stored mint rows, the prior rows' share denominator
-        -- changes (= they need re-attribution). Their (account_id, pool_id)
-        -- pairs are NOT in `new_rows` for this batch, so we pull them in via
-        -- the stored history for any affected (pool, tx). Burn re-attribution
-        -- (BEFORE-trigger rewriting account_id from pool → to_address) is
-        -- already reflected in `new_rows` per PG semantics — the NEW
-        -- transition table holds post-BEFORE-trigger values.
-        SELECT DISTINCT h.account_id, h.pool_id
-          FROM lp_position_history h
-          JOIN (SELECT DISTINCT pool_id, transaction_hash FROM new_rows) t
-            ON t.pool_id = h.pool_id AND t.transaction_hash = h.transaction_hash
-    ),
-    aggregates AS (
-        SELECT h.account_id, h.pool_id,
-               SUM(h.token0_in)      AS token0_in,
-               SUM(h.token0_out)     AS token0_out,
-               SUM(h.token1_in)      AS token1_in,
-               SUM(h.token1_out)     AS token1_out,
-               SUM(h.token0_in_usd)  AS token0_in_usd,
-               SUM(h.token0_out_usd) AS token0_out_usd,
-               SUM(h.token1_in_usd)  AS token1_in_usd,
-               SUM(h.token1_out_usd) AS token1_out_usd,
-               SUM(h.lp_in_usd)      AS lp_in_usd,
-               SUM(h.lp_out_usd)     AS lp_out_usd
-          FROM lp_position_history h
-          JOIN affected_pairs ap
-            ON ap.account_id = h.account_id AND ap.pool_id = h.pool_id
-          JOIN lp_position lp
-            ON lp.account_id = h.account_id AND lp.pool_id = h.pool_id
-         -- Restrict SUM to the CURRENT open epoch only. Re-entry after a
-         -- full exit creates a new lp_position row with fresh epoch_start_*
-         -- coordinates; history rows from prior (closed) epochs must NOT
-         -- contribute to the current row's cost basis.
-         WHERE (h.block_number, h.tx_index, h.log_index)
-             >= (lp.epoch_start_block, lp.epoch_start_tx_index, lp.epoch_start_log_index)
-         GROUP BY h.account_id, h.pool_id
-    )
-    UPDATE lp_position lp
-       SET token0_in      = a.token0_in,
-           token0_out     = a.token0_out,
-           token1_in      = a.token1_in,
-           token1_out     = a.token1_out,
-           token0_in_usd  = a.token0_in_usd,
-           token0_out_usd = a.token0_out_usd,
-           token1_in_usd  = a.token1_in_usd,
-           token1_out_usd = a.token1_out_usd,
-           lp_in_usd      = a.lp_in_usd,
-           lp_out_usd     = a.lp_out_usd
-      FROM aggregates a
-     WHERE lp.account_id = a.account_id
-       AND lp.pool_id    = a.pool_id;
-
-    RETURN NULL;
-END;
-$$ LANGUAGE plpgsql;
-
-DROP TRIGGER IF EXISTS trg_lp_position_on_history ON lp_position_history;  -- old single trigger
-DROP TRIGGER IF EXISTS trg_fill_lp_cost_basis     ON lp_position_history;
-DROP TRIGGER IF EXISTS trg_apply_lp_position      ON lp_position_history;
-DROP TRIGGER IF EXISTS trg_refresh_lp_position_cost_basis ON lp_position_history;
-
-CREATE TRIGGER trg_fill_lp_cost_basis
-    BEFORE INSERT ON lp_position_history
-    FOR EACH ROW EXECUTE FUNCTION fill_lp_cost_basis();
-
-CREATE TRIGGER trg_apply_lp_position
-    AFTER INSERT ON lp_position_history
-    FOR EACH ROW EXECUTE FUNCTION apply_lp_position();
-
-CREATE TRIGGER trg_refresh_lp_position_cost_basis
-    AFTER INSERT ON lp_position_history
-    REFERENCING NEW TABLE AS new_rows
-    FOR EACH STATEMENT EXECUTE FUNCTION refresh_lp_position_cost_basis();
-
--- ---------------------------------------------------------------------------
--- View: lp_position_cost_basis
---
--- Per-row derived cost basis for mint and burn events. The materialize
--- trigger above writes the same math into lp_position_history's token/USD
--- columns; this view stays as the canonical SQL definition of the math
--- (used by the one-time backfill below and by ad-hoc analytics).
---
--- Mint cost basis:
---   * Each lp_position_history mint row is matched to the dex_mint with the
---     smallest log_index greater than the row's own log_index (router-
---     aggregated multi-mint within a single tx works).
---   * feeTo rows (_mintFee() carve-out from k growth, NOT a deposit) get 0.
---   * Other rows: anchor-residual share-weighted attribution against non-
---     feeTo siblings of the same dex_mint. The LARGEST non-feeTo recipient
---     (by lp_in DESC, tie-break log_index ASC) absorbs the leftover wei so
---     Σ token0_in / token1_in over recipients = dex_mint.amount EXACTLY.
---
--- Burn cost basis:
---   * Full attribution to the single dex_burn row (matched by smallest
---     log_index > row.log_index, same rule as mint).
---
--- USD columns stay with ROUND(..., 10): naturally fractional, no wei-
--- integer conservation needed.
---
--- feeTo = factory(0x59c51c66...).feeTo() on testnet. Hardcoded SQL constant
--- for this deployment; move to a protocol_config table if the factory ever rotates feeTo.
--- ---------------------------------------------------------------------------
-DROP VIEW IF EXISTS lp_position_cost_basis;
-CREATE VIEW lp_position_cost_basis AS
-WITH mint_with_dm AS (
-    SELECT
-        ph.account_id,
-        ph.pool_id,
-        ph.transaction_hash,
-        ph.tx_index,
-        ph.log_index,
-        ph.event_type,
-        ph.lp_in,
-        dm.amount0    AS dm_amount0,
-        dm.amount1    AS dm_amount1,
-        dm.value      AS dm_value,
-        dm.token0_usd AS dm_token0_usd,
-        dm.token1_usd AS dm_token1_usd,
-        dm.log_index  AS dm_log_index
-      FROM lp_position_history ph
-      JOIN LATERAL (
-          SELECT *
-            FROM dex_mint
-           WHERE pool_id = ph.pool_id
-             AND transaction_hash = ph.transaction_hash
-             AND log_index > ph.log_index
-           ORDER BY log_index ASC LIMIT 1
-      ) dm ON true
-     WHERE ph.event_type = 'mint'
-),
-mint_truncs AS (
-    SELECT
-        ph.account_id,
-        ph.pool_id,
-        ph.transaction_hash,
-        ph.tx_index,
-        ph.log_index,
-        ph.event_type,
-        ph.lp_in,
-        ph.dm_amount0,
-        ph.dm_amount1,
-        ph.dm_value,
-        ph.dm_token0_usd,
-        ph.dm_token1_usd,
-        ph.dm_log_index,
-        r.real_lp,
-        -- TRUNC of share-weighted amount: each non-feeTo recipient's wei-integer floor.
-        -- feeTo rows zeroed (consistent with existing carve-out semantics).
-        CASE WHEN LOWER(ph.account_id) = '0x715103eeeac12fb84f5d3b35c3268dd767fa8b8a' THEN 0
-             ELSE TRUNC(ph.lp_in * ph.dm_amount0 / NULLIF(r.real_lp, 0))
-        END AS t0_trunc,
-        CASE WHEN LOWER(ph.account_id) = '0x715103eeeac12fb84f5d3b35c3268dd767fa8b8a' THEN 0
-             ELSE TRUNC(ph.lp_in * ph.dm_amount1 / NULLIF(r.real_lp, 0))
-        END AS t1_trunc,
-        -- Anchor row selection: the LARGEST non-feeTo recipient in this
-        -- (pool, tx, dex_mint) group. Tie-break by log_index ASC. feeTo
-        -- rows pushed to the end (rn never == 1 for them, so they never
-        -- receive the residual).
-        ROW_NUMBER() OVER (
-            PARTITION BY ph.pool_id, ph.transaction_hash, ph.dm_log_index
-            ORDER BY
-                CASE WHEN LOWER(ph.account_id) = '0x715103eeeac12fb84f5d3b35c3268dd767fa8b8a' THEN 1 ELSE 0 END,
-                ph.lp_in DESC,
-                ph.log_index ASC
-        ) AS anchor_rn
-      FROM mint_with_dm ph
-      JOIN LATERAL (
-          SELECT COALESCE(SUM(sib.lp_in), 0) AS real_lp
-            FROM mint_with_dm sib
-           WHERE sib.pool_id = ph.pool_id
-             AND sib.transaction_hash = ph.transaction_hash
-             AND sib.dm_log_index = ph.dm_log_index
-             AND LOWER(sib.account_id) <> '0x715103eeeac12fb84f5d3b35c3268dd767fa8b8a'
-      ) r ON true
-),
-mint_costs AS (
-    SELECT
-        mt.account_id,
-        mt.pool_id,
-        mt.transaction_hash,
-        mt.tx_index,
-        mt.log_index,
-        mt.event_type,
-        -- Anchor-residual: the largest non-feeTo recipient (anchor_rn=1)
-        -- absorbs the leftover wei so Σ over recipients = full amount.
-        -- feeTo rows stay at 0 (already zeroed in t0_trunc/t1_trunc).
-        -- Residual sum window MUST match the anchor partition: one residual per
-        -- dex_mint event, not per tx. A router-aggregated tx can hold multiple
-        -- dex_mints, each with its own dm_amount0 and its own anchor — they
-        -- must NOT share a residual pool.
-        CASE WHEN LOWER(mt.account_id) = '0x715103eeeac12fb84f5d3b35c3268dd767fa8b8a' THEN 0
-             WHEN mt.anchor_rn = 1
-                 THEN mt.t0_trunc + (mt.dm_amount0 - SUM(mt.t0_trunc) OVER (
-                        PARTITION BY mt.pool_id, mt.transaction_hash, mt.dm_log_index))
-             ELSE mt.t0_trunc
-        END AS token0_in,
-        CASE WHEN LOWER(mt.account_id) = '0x715103eeeac12fb84f5d3b35c3268dd767fa8b8a' THEN 0
-             WHEN mt.anchor_rn = 1
-                 THEN mt.t1_trunc + (mt.dm_amount1 - SUM(mt.t1_trunc) OVER (
-                        PARTITION BY mt.pool_id, mt.transaction_hash, mt.dm_log_index))
-             ELSE mt.t1_trunc
-        END AS token1_in,
-        -- USD columns keep ROUND(..., 10): naturally fractional, no need for
-        -- wei-integer conservation (USD is cents/sub-cents, not raw wei).
-        CASE WHEN LOWER(mt.account_id) = '0x715103eeeac12fb84f5d3b35c3268dd767fa8b8a' THEN 0
-             ELSE ROUND(mt.lp_in * COALESCE(mt.dm_token0_usd, 0) / NULLIF(mt.real_lp, 0), 10)
-        END AS token0_in_usd,
-        CASE WHEN LOWER(mt.account_id) = '0x715103eeeac12fb84f5d3b35c3268dd767fa8b8a' THEN 0
-             ELSE ROUND(mt.lp_in * COALESCE(mt.dm_token1_usd, 0) / NULLIF(mt.real_lp, 0), 10)
-        END AS token1_in_usd,
-        CASE WHEN LOWER(mt.account_id) = '0x715103eeeac12fb84f5d3b35c3268dd767fa8b8a' THEN 0
-             ELSE ROUND(mt.lp_in * COALESCE(mt.dm_value, 0) / NULLIF(mt.real_lp, 0), 10)
-        END AS lp_in_usd,
-        0::NUMERIC AS token0_out,
-        0::NUMERIC AS token1_out,
-        0::NUMERIC AS token0_out_usd,
-        0::NUMERIC AS token1_out_usd,
-        0::NUMERIC AS lp_out_usd
-      FROM mint_truncs mt
-),
-burn_costs AS (
-    SELECT
-        ph.account_id,
-        ph.pool_id,
-        ph.transaction_hash,
-        ph.tx_index,
-        ph.log_index,
-        ph.event_type,
-        0::NUMERIC AS token0_in,
-        0::NUMERIC AS token1_in,
-        0::NUMERIC AS token0_in_usd,
-        0::NUMERIC AS token1_in_usd,
-        0::NUMERIC AS lp_in_usd,
-        db.amount0 AS token0_out,
-        db.amount1 AS token1_out,
-        ROUND(COALESCE(db.token0_usd, 0), 10) AS token0_out_usd,
-        ROUND(COALESCE(db.token1_usd, 0), 10) AS token1_out_usd,
-        ROUND(COALESCE(db.value,      0), 10) AS lp_out_usd
-      FROM lp_position_history ph
-      JOIN LATERAL (
-          SELECT *
-            FROM dex_burn
-           WHERE pool_id = ph.pool_id
-             AND transaction_hash = ph.transaction_hash
-             AND log_index > ph.log_index
-           ORDER BY log_index ASC LIMIT 1
-      ) db ON true
-     WHERE ph.event_type = 'burn'
-)
-SELECT * FROM mint_costs
-UNION ALL
-SELECT * FROM burn_costs;
-
--- ---------------------------------------------------------------------------
--- One-time backfill: rebuild token/USD columns on lp_position_history
--- (per-row, via the same share-weighted view math) and on lp_position
--- (aggregate, via SUM-from-history). Idempotent — re-running on
--- already-correct data is a no-op.
--- ---------------------------------------------------------------------------
-
--- Defensive zero-reset before the selective view-based UPDATEs below.
--- Older revisions of this file (or older trigger logic) may have left stale
--- values on non-mint or non-burn rows (e.g. token0_out on a 'mint' row from
--- a pre-PR-#216 trigger). The selective backfill that follows only touches
--- mint-side cols on mint rows and burn-side cols on burn rows; without this
--- reset, the aggregate SUM-from-history would re-materialize the stale
--- values into lp_position. No-op on fresh DBs and on already-correct rows.
-UPDATE lp_position_history SET
-    token0_in      = 0, token0_out      = 0,
-    token1_in      = 0, token1_out      = 0,
-    token0_in_usd  = 0, token0_out_usd  = 0,
-    token1_in_usd  = 0, token1_out_usd  = 0,
-    lp_in_usd      = 0, lp_out_usd      = 0;
-
--- Backfill lp_position_history.token cols for ALL mint rows using the view
--- definition (which already encodes share-weighted feeTo-zero math).
-UPDATE lp_position_history h
-   SET token0_in     = v.token0_in,
-       token1_in     = v.token1_in,
-       token0_in_usd = v.token0_in_usd,
-       token1_in_usd = v.token1_in_usd,
-       lp_in_usd     = v.lp_in_usd
-  FROM lp_position_cost_basis v
- WHERE h.event_type       = 'mint'
-   AND h.account_id       = v.account_id
-   AND h.pool_id          = v.pool_id
-   AND h.transaction_hash = v.transaction_hash
-   AND h.tx_index         = v.tx_index
-   AND h.log_index        = v.log_index;
-
-UPDATE lp_position_history h
-   SET token0_out     = v.token0_out,
-       token1_out     = v.token1_out,
-       token0_out_usd = v.token0_out_usd,
-       token1_out_usd = v.token1_out_usd,
-       lp_out_usd     = v.lp_out_usd
-  FROM lp_position_cost_basis v
- WHERE h.event_type       = 'burn'
-   AND h.account_id       = v.account_id
-   AND h.pool_id          = v.pool_id
-   AND h.transaction_hash = v.transaction_hash
-   AND h.tx_index         = v.tx_index
-   AND h.log_index        = v.log_index;
-
--- Backfill epoch_start_* on every existing lp_position row to the start of
--- its CURRENT OPEN epoch. Without this, existing rows would have
--- epoch_start_* = 0 (column default) and the aggregate below would sum
--- across closed past epochs. The current-open-epoch start is the most
--- recent history row where running balance transitioned from 0 to >0.
-WITH running_after AS (
-    SELECT account_id, pool_id, block_number, tx_index, log_index,
-           SUM(lp_in - lp_out) OVER (
-               PARTITION BY account_id, pool_id
-               ORDER BY block_number, tx_index, log_index
-           ) AS bal_after
-      FROM lp_position_history
-),
-running_pair AS (
-    SELECT account_id, pool_id, block_number, tx_index, log_index, bal_after,
-           COALESCE(LAG(bal_after) OVER (
-               PARTITION BY account_id, pool_id
-               ORDER BY block_number, tx_index, log_index
-           ), 0) AS bal_before
-      FROM running_after
-),
-epoch_starts AS (
-    SELECT DISTINCT ON (account_id, pool_id)
-           account_id, pool_id, block_number, tx_index, log_index
-      FROM running_pair
-     WHERE bal_before = 0 AND bal_after > 0
-     ORDER BY account_id, pool_id, block_number DESC, tx_index DESC, log_index DESC
-)
-UPDATE lp_position lp
-   SET epoch_start_block     = es.block_number,
-       epoch_start_tx_index  = es.tx_index,
-       epoch_start_log_index = es.log_index
-  FROM epoch_starts es
- WHERE lp.account_id = es.account_id
-   AND lp.pool_id    = es.pool_id;
-
--- Backfill lp_position aggregate from history (now epoch-bounded).
-UPDATE lp_position lp
-   SET token0_in      = agg.token0_in,
-       token0_out     = agg.token0_out,
-       token1_in      = agg.token1_in,
-       token1_out     = agg.token1_out,
-       token0_in_usd  = agg.token0_in_usd,
-       token0_out_usd = agg.token0_out_usd,
-       token1_in_usd  = agg.token1_in_usd,
-       token1_out_usd = agg.token1_out_usd,
-       lp_in_usd      = agg.lp_in_usd,
-       lp_out_usd     = agg.lp_out_usd
-  FROM (
-      SELECT h.account_id, h.pool_id,
-             SUM(h.token0_in)      AS token0_in,
-             SUM(h.token0_out)     AS token0_out,
-             SUM(h.token1_in)      AS token1_in,
-             SUM(h.token1_out)     AS token1_out,
-             SUM(h.token0_in_usd)  AS token0_in_usd,
-             SUM(h.token0_out_usd) AS token0_out_usd,
-             SUM(h.token1_in_usd)  AS token1_in_usd,
-             SUM(h.token1_out_usd) AS token1_out_usd,
-             SUM(h.lp_in_usd)      AS lp_in_usd,
-             SUM(h.lp_out_usd)     AS lp_out_usd
-        FROM lp_position_history h
-        JOIN lp_position lp2
-          ON lp2.account_id = h.account_id AND lp2.pool_id = h.pool_id
-       WHERE (h.block_number, h.tx_index, h.log_index)
-           >= (lp2.epoch_start_block, lp2.epoch_start_tx_index, lp2.epoch_start_log_index)
-       GROUP BY h.account_id, h.pool_id
-  ) agg
- WHERE lp.account_id = agg.account_id
-   AND lp.pool_id    = agg.pool_id;
-
-
--- ============================================================================
--- >>> 0027_pool_fee_hourly.sql
--- ============================================================================
-
--- 0027_pool_fee_hourly.sql
---
--- LP fee accrual & APR tracking. See:
--- See the historical LP fee/APR design for derivation details.
---
--- (1) pool: baseline columns
-ALTER TABLE pool ADD COLUMN IF NOT EXISTS last_sqrt_k         NUMERIC NOT NULL DEFAULT 0; -- ratio (raw); sqrt(reserve0*reserve1), geometric mean of token-raw (wei) reserves — fee-accrual baseline
-ALTER TABLE pool ADD COLUMN IF NOT EXISTS last_sync_at        BIGINT  NOT NULL DEFAULT 0; -- unix seconds (last sync block timestamp)
-ALTER TABLE pool ADD COLUMN IF NOT EXISTS last_sync_block     BIGINT  NOT NULL DEFAULT 0;
-ALTER TABLE pool ADD COLUMN IF NOT EXISTS last_sync_tx_index  INT     NOT NULL DEFAULT 0;
-ALTER TABLE pool ADD COLUMN IF NOT EXISTS last_sync_log_index INT     NOT NULL DEFAULT 0;
-
--- (2) hourly bucket
-CREATE TABLE IF NOT EXISTS pool_fee_hourly (
-    pool_id        VARCHAR(42) NOT NULL,
-    bucket_hour    BIGINT      NOT NULL, -- unix-hours (created_at / 3600)
-    fee_token0     NUMERIC     NOT NULL DEFAULT 0, -- token raw (wei) of token0; share_growth * reserve0
-    fee_token1     NUMERIC     NOT NULL DEFAULT 0, -- token raw (wei) of token1; share_growth * reserve1
-    fee_usd        NUMERIC     NOT NULL DEFAULT 0, -- USD (human); share_growth * (token0_usd + token1_usd)
-    tvl_usd_sum    NUMERIC     NOT NULL DEFAULT 0, -- USD (human); sum of per-sync TVL (token0_usd+token1_usd), avg via /sample_count
-    sample_count   INT         NOT NULL DEFAULT 0,
-    updated_at     BIGINT      NOT NULL DEFAULT EXTRACT(EPOCH FROM CURRENT_TIMESTAMP)::BIGINT, -- unix seconds (last write)
-    PRIMARY KEY (pool_id, bucket_hour)
-);
-CREATE INDEX IF NOT EXISTS idx_pool_fee_hourly_pool_hour
-    ON pool_fee_hourly (pool_id, bucket_hour DESC);
-CREATE INDEX IF NOT EXISTS idx_pool_fee_hourly_hour
-    ON pool_fee_hourly (bucket_hour DESC);
-
--- (3) trigger function: sqrt(k) ratio fee accrual.
---
--- Algorithm:
---   share_growth = sqrt(k_new) / sqrt(k_old) - 1
---   fee_usd      = share_growth * (token0_usd + token1_usd)
---   fee_token0/1 = share_growth * reserve0/1  (share-growth equivalent)
---
--- Three correctness guards (codex P1+P2 fixes):
---   (a) Application-level serialization: process_raw_dex_events awaits
---       dex_mint/dex_burn inserts BEFORE dex_sync, so the LEFT JOIN below
---       is race-free in production.
---   (b) LAG runs over ALL syncs (mint/burn-blocked included). The
---       blocked predicate filters fee_rows only — blocked syncs still
---       advance the intra-batch baseline for the next swap.
---   (c) Baseline UPDATE and pool.last_sqrt_k fallback are guarded by an
---       on-chain freshness tuple (block_number, tx_index, log_index) so
---       out-of-order/reconnect-overlap inserts can't rewind the baseline
---       or accrue fee against a stale starting point.
-
--- (4) pool_apr view
---
--- Two fee scales exposed:
---   * fee_*_usd  / fee_*_token{0,1}  = gross pool-level fee retained in
---     reserves (every basis point of LP_FEE_RATE = 25 BPS = 0.25%).
---   * lp_fee_*   = LP-holder net share = gross × LP_SHARE_FACTOR (0.8).
---
--- Why 0.8: NadFunPair._mintFee uses `rootK * 4 + rootKLast` as the
--- carve-out denominator (vs the common constant-product denominator
--- `rootK * 5 + rootKLast`).
--- When factory.feeTo() != address(0) — the active configuration on this
--- deployment — that mints (√k_new - √k_last) / (5 × √k_new) of total LP
--- to the protocol at the next mint/burn, capturing 1/5 = 20% of accrued
--- fees and leaving LP holders with 80%. If feeTo is ever rotated to
--- address(0) this overstates protocol cut by 20% (LP would see full
--- gross); revisit then.
-CREATE OR REPLACE VIEW pool_apr AS
-WITH now_h AS (SELECT (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) / 3600)::BIGINT AS h),
-     params AS (SELECT 0.8::numeric AS lp_share_factor)
-SELECT
-    f.pool_id,
-    SUM(f.fee_usd) FILTER (WHERE f.bucket_hour >= now_h.h - 24)        AS fee_24h_usd,
-    SUM(f.fee_usd) FILTER (WHERE f.bucket_hour >= now_h.h - 24*7)      AS fee_7d_usd,
-    SUM(f.fee_usd) FILTER (WHERE f.bucket_hour >= now_h.h - 24*30)     AS fee_30d_usd,
-    SUM(f.fee_token0) FILTER (WHERE f.bucket_hour >= now_h.h - 24)     AS fee_24h_token0,
-    SUM(f.fee_token1) FILTER (WHERE f.bucket_hour >= now_h.h - 24)     AS fee_24h_token1,
-    SUM(f.fee_token0) FILTER (WHERE f.bucket_hour >= now_h.h - 24*7)   AS fee_7d_token0,
-    SUM(f.fee_token1) FILTER (WHERE f.bucket_hour >= now_h.h - 24*7)   AS fee_7d_token1,
-    SUM(f.fee_token0) FILTER (WHERE f.bucket_hour >= now_h.h - 24*30)  AS fee_30d_token0,
-    SUM(f.fee_token1) FILTER (WHERE f.bucket_hour >= now_h.h - 24*30)  AS fee_30d_token1,
-    -- LP-net (after _mintFee 20% protocol carve-out)
-    params.lp_share_factor * SUM(f.fee_usd) FILTER (WHERE f.bucket_hour >= now_h.h - 24)
-        AS lp_fee_24h_usd,
-    params.lp_share_factor * SUM(f.fee_usd) FILTER (WHERE f.bucket_hour >= now_h.h - 24*7)
-        AS lp_fee_7d_usd,
-    params.lp_share_factor * SUM(f.fee_usd) FILTER (WHERE f.bucket_hour >= now_h.h - 24*30)
-        AS lp_fee_30d_usd,
-    params.lp_share_factor AS lp_share_factor,
-    SUM(f.tvl_usd_sum) FILTER (WHERE f.bucket_hour >= now_h.h - 24)
-        / NULLIF(SUM(f.sample_count) FILTER (WHERE f.bucket_hour >= now_h.h - 24), 0)
-        AS tvl_24h_usd_avg,
-    SUM(f.tvl_usd_sum) FILTER (WHERE f.bucket_hour >= now_h.h - 24*7)
-        / NULLIF(SUM(f.sample_count) FILTER (WHERE f.bucket_hour >= now_h.h - 24*7), 0)
-        AS tvl_7d_usd_avg,
-    SUM(f.tvl_usd_sum) FILTER (WHERE f.bucket_hour >= now_h.h - 24*30)
-        / NULLIF(SUM(f.sample_count) FILTER (WHERE f.bucket_hour >= now_h.h - 24*30), 0)
-        AS tvl_30d_usd_avg
-FROM pool_fee_hourly f
-CROSS JOIN now_h
-CROSS JOIN params
-WHERE f.bucket_hour >= now_h.h - 24*30
-GROUP BY f.pool_id, now_h.h, params.lp_share_factor;
+DROP TRIGGER IF EXISTS gift_tweet_notify ON gift_tweet;
+CREATE TRIGGER gift_tweet_notify
+    AFTER INSERT ON gift_tweet
+    FOR EACH ROW
+    EXECUTE FUNCTION notify_gift_tweet_new();
 
 
 -- ============================================================================
@@ -2698,41 +1839,1708 @@ GROUP BY f.pool_id, now_h.h, params.lp_share_factor;
 -- the indexer reads "every quote_token where is_native = true" at startup
 -- and treats all of them as native-equivalent.
 --
--- DEFAULT TRUE: current quote_token only holds the native-pegged WETH row,
--- so backfilling existing data to TRUE is the desired state and avoids a
--- separate UPDATE. Future non-native quotes (USDC, USDT, ...) must INSERT with
--- an explicit `is_native = FALSE`.
---
--- Idempotent: ALTER ... IF NOT EXISTS. Safe to re-run.
+-- DEFAULT TRUE marks the seeded native-pegged WETH row. Future non-native
+-- quotes (USDC, USDT, ...) must INSERT with an explicit `is_native = FALSE`.
 
 ALTER TABLE quote_token
     ADD COLUMN IF NOT EXISTS is_native BOOLEAN NOT NULL DEFAULT TRUE;
 
 
 -- ============================================================================
--- >>> 0018_api_keys.sql (GIWA identity variant)
+-- >>> dividend.sql
 -- ============================================================================
 
--- The retained /api-key API needs this table on fresh databases. GIWA does
--- not install pgactive, so IDs use PostgreSQL's built-in identity generator.
-CREATE TABLE IF NOT EXISTS api_keys (
-    id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
-    key_hash VARCHAR(64) NOT NULL UNIQUE,
-    key_prefix VARCHAR(12) NOT NULL,
-    name VARCHAR(255) NOT NULL,
-    description TEXT,
-    owner_address VARCHAR(42),
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    expires_at TIMESTAMPTZ,
-    last_used_at TIMESTAMPTZ,
-    is_active BOOLEAN NOT NULL DEFAULT TRUE,
-    request_count BIGINT NOT NULL DEFAULT 0
+-- ============================================================================
+-- DividendVault indexing schema
+--
+-- Contract: singleton UUPS DividendVault (one address, all source tokens).
+-- Indexed events (5):
+--   DividendSetup(sourceToken idx, dividendTokens[], ratios[], minBalance)
+--   Deposit(sourceToken idx, dividendTokens[], slices[], pending[])
+--   Converted(sourceTokens[], dividendTokens[], consumedQuote[], received[])
+--   SetMerkleRoot(merkleRoot idx)
+--   Claim(holder idx, sourceTokens[], dividendTokens[], amounts[])
+--
+-- Contract facts the schema relies on (verified in DividendVault.sol):
+--   * setup() is one-time immutable per sourceToken (reverts AlreadyConfigured,
+--     DividendVault.sol:93) -> dividend_setups doubles as config lookup.
+--   * Deposit fires ONCE per afterDeposit with ALL ratio slices (parallel
+--     arrays). For each entry i: slices[i] is the quote-denominated slice and
+--     pending[i] = (dividendToken != quoteToken). pending=false -> credited
+--     immediately to dividendBalance; pending=true -> accrued to pendingSwap
+--     and later consumed by Converted. There is NO balance snapshot field.
+--   * Converted does NOT carry the resulting balance -> stats use arithmetic.
+--   * claim() does NOT decrement on-chain dividendBalance -> dividend_balance
+--     in stats is CUMULATIVE (deposited + converted received), mirroring chain.
+--   * Claim amounts[i] == 0 means the item was skipped on-chain (ineligible /
+--     already claimed / insufficient vault balance). Zero entries are NOT
+--     inserted: this table is PAID claim history, not attempt history.
+--
+-- Pattern: history INSERT (ON CONFLICT DO NOTHING) -> AFTER INSERT trigger
+--          upserts dividend_vault_stats in the same transaction. Trigger
+--          fires only on rows actually inserted: insert success -> update.
+--          This is REPLAY-idempotent (re-processing the same logs is safe).
+--          It is NOT reorg-rollback: orphaned rows are not removed (observer
+--          has no rollback machinery anywhere; same property as all tables).
+--
+-- Insert ordering requirement (controller): within a receive batch,
+--   dividend_merkle_roots MUST be inserted BEFORE dividend_claims so the
+--   claims' merkle_root insert-time lookup sees roots from the same batch.
+--
+-- LOCAL-DEV reset note: earlier commits on this branch created the dividend_*
+--   tables with the OLD deposit shape (dividend_balance column, 3-col PK). Because
+--   the tables use CREATE TABLE IF NOT EXISTS, a dev who ran an earlier branch
+--   commit must DROP the dividend_* tables locally before re-running this file
+--   — otherwise deposit inserts fail on the missing pending / entry_index columns.
+--   Prod has no dividend tables yet, so prod is unaffected (no ALTER needed here).
+-- ============================================================================
+
+BEGIN;
+
+-- ----------------------------------------------------------------------------
+-- 1) History: DividendSetup (exploded: one row per dividend token entry)
+--    setup() is once-per-source immutable -> also serves as config lookup.
+-- ----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS dividend_setups (
+    source_token     VARCHAR(42) NOT NULL,
+    dividend_token   VARCHAR(42) NOT NULL,
+    ratio            INT NOT NULL,            -- BPS (uint16, sums to 10000 per source)
+    min_balance      NUMERIC NOT NULL,        -- min sourceToken holding to claim
+    entry_index      INT NOT NULL,            -- position in dividendTokens[]
+    transaction_hash VARCHAR NOT NULL,
+    block_number     BIGINT NOT NULL,
+    created_at       BIGINT NOT NULL,         -- block timestamp
+    log_index        INT NOT NULL,
+    tx_index         INT NOT NULL,
+    PRIMARY KEY (transaction_hash, tx_index, log_index, entry_index)
+);
+-- contract enforces ZeroRatio / BPS total
+ALTER TABLE dividend_setups
+    DROP CONSTRAINT IF EXISTS chk_dividend_setups_ratio;
+ALTER TABLE dividend_setups
+    ADD CONSTRAINT chk_dividend_setups_ratio
+    CHECK (ratio > 0 AND ratio <= 10000);
+CREATE INDEX IF NOT EXISTS idx_dividend_setups_source
+    ON dividend_setups (source_token);
+
+-- ----------------------------------------------------------------------------
+-- 2) History: Deposit (exploded: one row per ratio slice)
+--    Emitted ONCE per afterDeposit with ALL slices. amount is the per-slice
+--    quote-denominated value; pending distinguishes immediate credit
+--    (pending=false, dividend_token == quote) from swap-pending accrual
+--    (pending=true, dividend_token != quote, later consumed by Converted).
+--    No on-chain balance snapshot exists in the new event shape.
+-- ----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS dividend_deposits (
+    source_token     VARCHAR(42) NOT NULL,
+    dividend_token   VARCHAR(42) NOT NULL,    -- target dividend token for this slice
+    amount           NUMERIC NOT NULL,        -- per-slice value (quote units)
+    pending          BOOLEAN NOT NULL,        -- true = swap-pending; false = immediate credit
+    entry_index      INT NOT NULL,            -- position in dividendTokens[]/slices[]
+    transaction_hash VARCHAR NOT NULL,
+    block_number     BIGINT NOT NULL,
+    created_at       BIGINT NOT NULL,
+    log_index        INT NOT NULL,
+    tx_index         INT NOT NULL,
+    quote_id         VARCHAR(42),             -- quote token used for USD pricing
+    usd_value        NUMERIC NOT NULL DEFAULT 0,  -- USD of amount (quote-priced)
+    PRIMARY KEY (transaction_hash, tx_index, log_index, entry_index)
+);
+CREATE INDEX IF NOT EXISTS idx_dividend_deposits_pair
+    ON dividend_deposits (source_token, dividend_token);
+
+-- ----------------------------------------------------------------------------
+-- 3) History: Converted (exploded: one row per conversion order)
+--    USD semantics: usd_value prices consumed_quote (quote units are reliably
+--    priceable via quote->WMON->Pyth). received is raw dividendToken units;
+--    its USD value is intentionally NOT stored (arbitrary ERC20, often
+--    unpriceable — avoid silently-bogus numbers).
+-- ----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS dividend_conversions (
+    source_token     VARCHAR(42) NOT NULL,
+    dividend_token   VARCHAR(42) NOT NULL,
+    consumed_quote   NUMERIC NOT NULL,        -- quote consumed from pendingSwap
+    received         NUMERIC NOT NULL,        -- dividendToken credited (balance delta)
+    entry_index      INT NOT NULL,            -- order index within the batch event
+    transaction_hash VARCHAR NOT NULL,
+    block_number     BIGINT NOT NULL,
+    created_at       BIGINT NOT NULL,
+    log_index        INT NOT NULL,
+    tx_index         INT NOT NULL,
+    quote_id         VARCHAR(42),             -- quote token used for USD pricing
+    usd_value        NUMERIC NOT NULL DEFAULT 0,  -- USD of consumed_quote
+    PRIMARY KEY (transaction_hash, tx_index, log_index, entry_index)
+);
+CREATE INDEX IF NOT EXISTS idx_dividend_conversions_pair
+    ON dividend_conversions (source_token, dividend_token);
+
+-- ----------------------------------------------------------------------------
+-- 4) History: SetMerkleRoot (distribution period markers)
+-- ----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS dividend_merkle_roots (
+    merkle_root      VARCHAR(66) NOT NULL,    -- 0x + 64 hex
+    transaction_hash VARCHAR NOT NULL,
+    block_number     BIGINT NOT NULL,
+    created_at       BIGINT NOT NULL,
+    log_index        INT NOT NULL,
+    tx_index         INT NOT NULL,
+    PRIMARY KEY (transaction_hash, tx_index, log_index)
+);
+-- Latest-root lookup (claims enrichment + "current root" queries).
+CREATE INDEX IF NOT EXISTS idx_dividend_merkle_roots_coords
+    ON dividend_merkle_roots (block_number DESC, tx_index DESC, log_index DESC);
+
+-- ----------------------------------------------------------------------------
+-- 5) History: Claim — PAID entries only (exploded; zero/skipped NOT inserted)
+--    merkle_root = period the claim was paid under, resolved at insert time as
+--    the latest SetMerkleRoot at or before the claim's (block, tx, log) coords.
+--    NULL only if no root event was ever indexed before the claim (shouldn't
+--    happen: claim() reverts when merkleRoot is unset).
+--    usd_value prices amount via the dividend token's cached USD price;
+--    0 when the token is not WMON-reachable (pricing misses are logged).
+-- ----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS dividend_claims (
+    holder           VARCHAR(42) NOT NULL,
+    source_token     VARCHAR(42) NOT NULL,
+    dividend_token   VARCHAR(42) NOT NULL,
+    amount           NUMERIC NOT NULL,        -- paid amount (dividendToken units)
+    merkle_root      VARCHAR(66),             -- distribution period (resolved at insert)
+    entry_index      INT NOT NULL,            -- position in the claim arrays
+    transaction_hash VARCHAR NOT NULL,
+    block_number     BIGINT NOT NULL,
+    created_at       BIGINT NOT NULL,
+    log_index        INT NOT NULL,
+    tx_index         INT NOT NULL,
+    usd_value        NUMERIC NOT NULL DEFAULT 0,  -- USD of amount (0 if unpriceable)
+    PRIMARY KEY (transaction_hash, tx_index, log_index, entry_index)
+);
+-- paid-only table; zero entries rejected
+ALTER TABLE dividend_claims
+    DROP CONSTRAINT IF EXISTS chk_dividend_claims_amount;
+ALTER TABLE dividend_claims
+    ADD CONSTRAINT chk_dividend_claims_amount
+    CHECK (amount > 0);
+CREATE INDEX IF NOT EXISTS idx_dividend_claims_holder
+    ON dividend_claims (holder);
+CREATE INDEX IF NOT EXISTS idx_dividend_claims_pair
+    ON dividend_claims (source_token, dividend_token);
+CREATE INDEX IF NOT EXISTS idx_dividend_claims_root
+    ON dividend_claims (merkle_root);
+
+-- ----------------------------------------------------------------------------
+-- 6) Aggregate: per (source_token, dividend_token) pair
+--    All NUMERIC columns are denominated in that row's dividend_token units
+--    (deposits qualify: their dividend_token IS the quote token).
+--    claim_count counts PAID ENTRIES, not claim transactions or unique holders.
+-- ----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS dividend_vault_stats (
+    source_token             VARCHAR(42) NOT NULL,
+    dividend_token           VARCHAR(42) NOT NULL,
+    total_deposited          NUMERIC NOT NULL DEFAULT 0,  -- immediate slices (quote units)
+    total_deposited_usd      NUMERIC NOT NULL DEFAULT 0,
+    total_pending_deposited  NUMERIC NOT NULL DEFAULT 0,  -- swap-pending slices (quote units)
+    total_pending_deposited_usd NUMERIC NOT NULL DEFAULT 0,
+    total_consumed_quote     NUMERIC NOT NULL DEFAULT 0,  -- quote spent in conversions
+    total_converted_received NUMERIC NOT NULL DEFAULT 0,  -- dividendToken from conversions
+    -- quote awaiting conversion = pending deposited − consumed by Converted.
+    -- A transient OR persisted NEGATIVE value is an ordering / replay-gap signal
+    -- (a Converted row landing before its matching pending Deposit — within a
+    -- batch the deposit/conversion inserts run concurrently, or across batches),
+    -- NOT silent corruption. On-chain the contract never lets pendingSwap go
+    -- negative, so a persisted negative means that (source_token, dividend_token)
+    -- range must be re-indexed. Readers treating this as a displayable balance
+    -- should GREATEST(pending_swap_balance, 0).
+    pending_swap_balance     NUMERIC GENERATED ALWAYS AS
+                                 (total_pending_deposited - total_consumed_quote) STORED,
+    dividend_balance         NUMERIC NOT NULL DEFAULT 0,  -- cumulative mirror:
+                                                          -- total_deposited + total_converted_received
+    total_claimed            NUMERIC NOT NULL DEFAULT 0,  -- dividendToken paid to holders
+    total_claimed_usd        NUMERIC NOT NULL DEFAULT 0,
+    claim_count              INT NOT NULL DEFAULT 0,      -- paid entries
+    last_block               BIGINT NOT NULL DEFAULT 0,
+    updated_at               BIGINT NOT NULL DEFAULT 0,
+    PRIMARY KEY (source_token, dividend_token)
 );
 
-CREATE INDEX IF NOT EXISTS idx_api_keys_key_hash ON api_keys (key_hash);
-CREATE INDEX IF NOT EXISTS idx_api_keys_active
-    ON api_keys (is_active)
-    WHERE is_active = TRUE;
+-- ----------------------------------------------------------------------------
+-- Triggers: history insert success -> stats update (same transaction)
+-- ----------------------------------------------------------------------------
+
+-- Setup: seed the stats row so every configured pair exists with zeros
+-- (setup is once-per-source immutable; DO NOTHING is reorg-replay-safe).
+CREATE OR REPLACE FUNCTION update_dividend_stats_on_setup()
+RETURNS TRIGGER AS $$
+BEGIN
+    INSERT INTO dividend_vault_stats (source_token, dividend_token, last_block, updated_at)
+    VALUES (NEW.source_token, NEW.dividend_token, NEW.block_number, NEW.created_at)
+    ON CONFLICT (source_token, dividend_token) DO NOTHING;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_dividend_stats_on_setup ON dividend_setups;
+CREATE TRIGGER trg_dividend_stats_on_setup
+AFTER INSERT ON dividend_setups
+FOR EACH ROW EXECUTE FUNCTION update_dividend_stats_on_setup();
+
+-- Deposit: branch on pending.
+--   pending=false -> immediate credit: total_deposited / _usd / dividend_balance.
+--   pending=true  -> swap-pending accrual: total_pending_deposited / _usd only
+--                    (dividend_balance is NOT touched; conversion credits it later).
+CREATE OR REPLACE FUNCTION update_dividend_stats_on_deposit()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF NEW.pending THEN
+        INSERT INTO dividend_vault_stats
+            (source_token, dividend_token, total_pending_deposited,
+             total_pending_deposited_usd, last_block, updated_at)
+        VALUES
+            (NEW.source_token, NEW.dividend_token, NEW.amount, NEW.usd_value,
+             NEW.block_number, NEW.created_at)
+        ON CONFLICT (source_token, dividend_token) DO UPDATE SET
+            total_pending_deposited     = dividend_vault_stats.total_pending_deposited     + EXCLUDED.total_pending_deposited,
+            total_pending_deposited_usd = dividend_vault_stats.total_pending_deposited_usd + EXCLUDED.total_pending_deposited_usd,
+            last_block                  = GREATEST(dividend_vault_stats.last_block, EXCLUDED.last_block),
+            updated_at                  = GREATEST(dividend_vault_stats.updated_at, EXCLUDED.updated_at);
+    ELSE
+        INSERT INTO dividend_vault_stats
+            (source_token, dividend_token, total_deposited, total_deposited_usd,
+             dividend_balance, last_block, updated_at)
+        VALUES
+            (NEW.source_token, NEW.dividend_token, NEW.amount, NEW.usd_value,
+             NEW.amount, NEW.block_number, NEW.created_at)
+        ON CONFLICT (source_token, dividend_token) DO UPDATE SET
+            total_deposited     = dividend_vault_stats.total_deposited     + EXCLUDED.total_deposited,
+            total_deposited_usd = dividend_vault_stats.total_deposited_usd + EXCLUDED.total_deposited_usd,
+            dividend_balance    = dividend_vault_stats.dividend_balance    + EXCLUDED.dividend_balance,
+            last_block          = GREATEST(dividend_vault_stats.last_block, EXCLUDED.last_block),
+            updated_at          = GREATEST(dividend_vault_stats.updated_at, EXCLUDED.updated_at);
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_dividend_stats_on_deposit ON dividend_deposits;
+CREATE TRIGGER trg_dividend_stats_on_deposit
+AFTER INSERT ON dividend_deposits
+FOR EACH ROW EXECUTE FUNCTION update_dividend_stats_on_deposit();
+
+-- Conversion: pendingSwap -> dividendBalance.
+CREATE OR REPLACE FUNCTION update_dividend_stats_on_conversion()
+RETURNS TRIGGER AS $$
+BEGIN
+    INSERT INTO dividend_vault_stats
+        (source_token, dividend_token, total_consumed_quote, total_converted_received,
+         dividend_balance, last_block, updated_at)
+    VALUES
+        (NEW.source_token, NEW.dividend_token, NEW.consumed_quote, NEW.received,
+         NEW.received, NEW.block_number, NEW.created_at)
+    ON CONFLICT (source_token, dividend_token) DO UPDATE SET
+        total_consumed_quote     = dividend_vault_stats.total_consumed_quote     + EXCLUDED.total_consumed_quote,
+        total_converted_received = dividend_vault_stats.total_converted_received + EXCLUDED.total_converted_received,
+        dividend_balance         = dividend_vault_stats.dividend_balance         + EXCLUDED.dividend_balance,
+        last_block               = GREATEST(dividend_vault_stats.last_block, EXCLUDED.last_block),
+        updated_at               = GREATEST(dividend_vault_stats.updated_at, EXCLUDED.updated_at);
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_dividend_stats_on_conversion ON dividend_conversions;
+CREATE TRIGGER trg_dividend_stats_on_conversion
+AFTER INSERT ON dividend_conversions
+FOR EACH ROW EXECUTE FUNCTION update_dividend_stats_on_conversion();
+
+-- Claim: paid out to holder (does NOT reduce dividend_balance — chain doesn't).
+CREATE OR REPLACE FUNCTION update_dividend_stats_on_claim()
+RETURNS TRIGGER AS $$
+BEGIN
+    INSERT INTO dividend_vault_stats
+        (source_token, dividend_token, total_claimed, total_claimed_usd,
+         claim_count, last_block, updated_at)
+    VALUES
+        (NEW.source_token, NEW.dividend_token, NEW.amount, NEW.usd_value,
+         1, NEW.block_number, NEW.created_at)
+    ON CONFLICT (source_token, dividend_token) DO UPDATE SET
+        total_claimed     = dividend_vault_stats.total_claimed     + EXCLUDED.total_claimed,
+        total_claimed_usd = dividend_vault_stats.total_claimed_usd + EXCLUDED.total_claimed_usd,
+        claim_count       = dividend_vault_stats.claim_count       + 1,
+        last_block        = GREATEST(dividend_vault_stats.last_block, EXCLUDED.last_block),
+        updated_at        = GREATEST(dividend_vault_stats.updated_at, EXCLUDED.updated_at);
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_dividend_stats_on_claim ON dividend_claims;
+CREATE TRIGGER trg_dividend_stats_on_claim
+AFTER INSERT ON dividend_claims
+FOR EACH ROW EXECUTE FUNCTION update_dividend_stats_on_claim();
+
+-- ----------------------------------------------------------------------------
+-- Backfill: rebuild stats from history in ONE statement set, same transaction.
+-- Safe to run on fresh installs (empty history -> no-op). On live systems run
+-- inside this migration transaction only — single full-aggregate rebuild, no
+-- cross-statement additive accumulation (partial runs cannot corrupt totals).
+-- ----------------------------------------------------------------------------
+TRUNCATE dividend_vault_stats;
+
+-- pending_swap_balance is a GENERATED column — Postgres computes it; it is
+-- intentionally EXCLUDED from the INSERT column list.
+INSERT INTO dividend_vault_stats
+    (source_token, dividend_token,
+     total_deposited, total_deposited_usd,
+     total_pending_deposited, total_pending_deposited_usd,
+     total_consumed_quote, total_converted_received,
+     dividend_balance,
+     total_claimed, total_claimed_usd, claim_count,
+     last_block, updated_at)
+SELECT
+    pair.source_token,
+    pair.dividend_token,
+    COALESCE(d.total_deposited, 0),
+    COALESCE(d.total_deposited_usd, 0),
+    COALESCE(d.total_pending_deposited, 0),
+    COALESCE(d.total_pending_deposited_usd, 0),
+    COALESCE(c.total_consumed_quote, 0),
+    COALESCE(c.total_converted_received, 0),
+    COALESCE(d.total_deposited, 0) + COALESCE(c.total_converted_received, 0),
+    COALESCE(cl.total_claimed, 0),
+    COALESCE(cl.total_claimed_usd, 0),
+    COALESCE(cl.claim_count, 0),
+    GREATEST(COALESCE(s.last_block, 0), COALESCE(d.last_block, 0),
+             COALESCE(c.last_block, 0), COALESCE(cl.last_block, 0)),
+    GREATEST(COALESCE(s.updated_at, 0), COALESCE(d.updated_at, 0),
+             COALESCE(c.updated_at, 0), COALESCE(cl.updated_at, 0))
+FROM (
+    SELECT source_token, dividend_token FROM dividend_setups
+    UNION
+    SELECT source_token, dividend_token FROM dividend_deposits
+    UNION
+    SELECT source_token, dividend_token FROM dividend_conversions
+    UNION
+    SELECT source_token, dividend_token FROM dividend_claims
+) AS pair
+LEFT JOIN (
+    SELECT source_token, dividend_token,
+           MAX(block_number) AS last_block, MAX(created_at) AS updated_at
+    FROM dividend_setups GROUP BY 1, 2
+) s USING (source_token, dividend_token)
+LEFT JOIN (
+    -- Split deposits by pending: immediate (pending=false) feeds total_deposited
+    -- and the dividend_balance sum; pending=true feeds total_pending_deposited.
+    SELECT source_token, dividend_token,
+           SUM(amount) FILTER (WHERE NOT pending) AS total_deposited,
+           SUM(usd_value) FILTER (WHERE NOT pending) AS total_deposited_usd,
+           SUM(amount) FILTER (WHERE pending) AS total_pending_deposited,
+           SUM(usd_value) FILTER (WHERE pending) AS total_pending_deposited_usd,
+           MAX(block_number) AS last_block, MAX(created_at) AS updated_at
+    FROM dividend_deposits GROUP BY 1, 2
+) d USING (source_token, dividend_token)
+LEFT JOIN (
+    SELECT source_token, dividend_token,
+           SUM(consumed_quote) AS total_consumed_quote, SUM(received) AS total_converted_received,
+           MAX(block_number) AS last_block, MAX(created_at) AS updated_at
+    FROM dividend_conversions GROUP BY 1, 2
+) c USING (source_token, dividend_token)
+LEFT JOIN (
+    SELECT source_token, dividend_token,
+           SUM(amount) AS total_claimed, SUM(usd_value) AS total_claimed_usd,
+           COUNT(*) AS claim_count,
+           MAX(block_number) AS last_block, MAX(created_at) AS updated_at
+    FROM dividend_claims GROUP BY 1, 2
+) cl USING (source_token, dividend_token);
 
 
 -- ============================================================================
+-- Scheduler distribution and accrual schema.
+-- history INSERT -> trigger -> aggregate; leaf amount = cumulative accrued.
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS dividend_accrual_history (
+    source_token     VARCHAR(42) NOT NULL,
+    dividend_token   VARCHAR(42) NOT NULL,
+    holder           VARCHAR(42) NOT NULL,
+    accrued          NUMERIC(78,0) NOT NULL CHECK (accrued >= 0),
+    snapshot_balance NUMERIC(78,0) NOT NULL CHECK (snapshot_balance >= 0),
+    balance_to       NUMERIC(78,0) NOT NULL CHECK (balance_to >= 0),
+    snapshot_block   BIGINT  NOT NULL,
+    created_at       BIGINT  NOT NULL,
+    PRIMARY KEY (source_token, dividend_token, holder, balance_to)
+);
+CREATE INDEX IF NOT EXISTS idx_dividend_accrual_history_pair ON dividend_accrual_history (source_token, dividend_token);
+
+CREATE TABLE IF NOT EXISTS dividend_accrual (
+    source_token   VARCHAR(42) NOT NULL,
+    holder         VARCHAR(42) NOT NULL,
+    dividend_token VARCHAR(42) NOT NULL,
+    accrued        NUMERIC(78,0) NOT NULL DEFAULT 0 CHECK (accrued >= 0),
+    updated_at     BIGINT  NOT NULL DEFAULT 0,
+    PRIMARY KEY (source_token, holder, dividend_token)
+);
+CREATE INDEX IF NOT EXISTS idx_dividend_accrual_holder ON dividend_accrual (holder);
+
+CREATE TABLE IF NOT EXISTS dividend_pair_state (
+    source_token           VARCHAR(42) NOT NULL,
+    dividend_token         VARCHAR(42) NOT NULL,
+    last_allocated_balance NUMERIC(78,0) NOT NULL DEFAULT 0 CHECK (last_allocated_balance >= 0),
+    last_snapshot_block    BIGINT  NOT NULL DEFAULT 0,
+    updated_at             BIGINT  NOT NULL DEFAULT 0,
+    PRIMARY KEY (source_token, dividend_token)
+);
+
+CREATE OR REPLACE FUNCTION update_dividend_accrual_on_history()
+RETURNS TRIGGER AS $$
+BEGIN
+    INSERT INTO dividend_accrual (source_token, holder, dividend_token, accrued, updated_at)
+    VALUES (NEW.source_token, NEW.holder, NEW.dividend_token, NEW.accrued, NEW.created_at)
+    ON CONFLICT (source_token, holder, dividend_token) DO UPDATE SET
+        accrued    = dividend_accrual.accrued + EXCLUDED.accrued,
+        updated_at = GREATEST(dividend_accrual.updated_at, EXCLUDED.updated_at);
+
+    INSERT INTO dividend_pair_state (source_token, dividend_token, last_allocated_balance, last_snapshot_block, updated_at)
+    VALUES (NEW.source_token, NEW.dividend_token, NEW.balance_to, NEW.snapshot_block, NEW.created_at)
+    ON CONFLICT (source_token, dividend_token) DO UPDATE SET
+        last_allocated_balance = GREATEST(dividend_pair_state.last_allocated_balance, EXCLUDED.last_allocated_balance),
+        last_snapshot_block    = GREATEST(dividend_pair_state.last_snapshot_block, EXCLUDED.last_snapshot_block),
+        updated_at             = GREATEST(dividend_pair_state.updated_at, EXCLUDED.updated_at);
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_dividend_accrual_on_history ON dividend_accrual_history;
+CREATE TRIGGER trg_dividend_accrual_on_history
+AFTER INSERT ON dividend_accrual_history
+FOR EACH ROW EXECUTE FUNCTION update_dividend_accrual_on_history();
+
+CREATE TABLE IF NOT EXISTS dividend_merkle_root (
+    merkle_root      VARCHAR(66) PRIMARY KEY,
+    transaction_hash VARCHAR NOT NULL,
+    leaf_count       INT NOT NULL,
+    created_at       BIGINT NOT NULL
+);
+
+-- Latest-only claim snapshot (one row per (source, holder, dividend); rebuilt each run via upsert).
+-- status set at build time from dividend_claims (CLAIMED = claimed >= amount). Cumulative model:
+-- a new root grows amount, flipping status back to AWAITING. No per-root history kept.
+CREATE TABLE IF NOT EXISTS dividend_distribution (
+    source_token   VARCHAR(42) NOT NULL,
+    holder         VARCHAR(42) NOT NULL,
+    dividend_token VARCHAR(42) NOT NULL,
+    merkle_root    VARCHAR(66) NOT NULL,                          -- current published root
+    amount         NUMERIC(78,0) NOT NULL CHECK (amount >= 0),    -- leaf = cumulative accrued
+    proof          TEXT[]  NOT NULL,
+    status         VARCHAR NOT NULL CHECK (status IN ('AWAITING', 'CLAIMED')),
+    created_at     BIGINT  NOT NULL,
+    PRIMARY KEY (source_token, holder, dividend_token)
+);
+CREATE INDEX IF NOT EXISTS idx_dividend_distribution_holder ON dividend_distribution (holder);
+
+-- BACKFILL (rebuild aggregates from history). pair_state must come from ONE row per pair
+-- (the max-balance_to row) so its (balance, snapshot_block) stay paired (Codex L10).
+TRUNCATE dividend_accrual;
+INSERT INTO dividend_accrual (source_token, holder, dividend_token, accrued, updated_at)
+SELECT source_token, holder, dividend_token, SUM(accrued), MAX(created_at)
+FROM dividend_accrual_history GROUP BY source_token, holder, dividend_token;
+
+TRUNCATE dividend_pair_state;
+INSERT INTO dividend_pair_state (source_token, dividend_token, last_allocated_balance, last_snapshot_block, updated_at)
+SELECT DISTINCT ON (source_token, dividend_token)
+       source_token, dividend_token, balance_to, snapshot_block, created_at
+FROM dividend_accrual_history
+ORDER BY source_token, dividend_token, balance_to DESC, snapshot_block DESC, created_at DESC;
+
+COMMIT;
+
+-- ============================================================================
+-- >>> vault.sql
+-- ============================================================================
+
+-- ======================================================================
+-- Vault schema — single source of truth for all vault-related data.
+-- ----------------------------------------------------------------------
+-- Covers BurnVault, LPVault, CreatorFeeVault, GiftVault and the
+-- VaultRegistry that catalogues them.
+--
+-- Contents
+--
+--   1. Event log tables
+--      - vault_burns
+--      - vault_lp_injections
+--      - creator_fee_claims
+--      - gifts
+--      - creator_updates
+--      - gift_expiry_updates
+--      - vault_registry
+--      - vault_metadata
+--   2. Pre-aggregated stat tables (per token)
+--      - burn_vault_stats
+--      - lp_vault_stats
+--      - creator_fee_vault_stats  (with current_balance)
+--      - gift_vault_stats         (with current_state, current_balance)
+--   3. AFTER INSERT triggers that maintain the stat tables
+--   4. Initial aggregate materialization from event rows
+--
+-- creator_fee_distribution lives in the contract-event section (it's a
+-- CreatorFeeProcessor event, not a vault event).
+-- ======================================================================
+
+BEGIN;
+
+-- ======================================================================
+-- 1. Event log tables
+-- ======================================================================
+
+-- 1.1 vault_burns — BurnVault.Burn / GiftVault.Burn
+CREATE TABLE IF NOT EXISTS vault_burns (
+    vault_type VARCHAR NOT NULL,
+    token_id VARCHAR(42) NOT NULL,
+    quote_in NUMERIC NOT NULL,       -- UNIT: quote raw (wei) — BurnVault.Burn.quoteIn
+    token_burned NUMERIC NOT NULL,   -- UNIT: token raw (wei) — BurnVault.Burn.tokenBurned
+    transaction_hash VARCHAR NOT NULL,
+    block_number BIGINT NOT NULL,
+    created_at BIGINT NOT NULL,
+    log_index INT NOT NULL,
+    tx_index INT NOT NULL,
+    quote_id VARCHAR(42),
+    usd_value NUMERIC NOT NULL DEFAULT 0,  -- UNIT: USD (human) — quote_in / 10^quote_decimals * quote_price
+    PRIMARY KEY (transaction_hash, tx_index, log_index)
+);
+CREATE INDEX IF NOT EXISTS idx_vault_burns_token
+    ON vault_burns (token_id);
+
+-- 1.2 vault_lp_injections — LPVault.AddLiquidity
+CREATE TABLE IF NOT EXISTS vault_lp_injections (
+    token_id VARCHAR(42) NOT NULL,
+    quote_used NUMERIC NOT NULL,     -- UNIT: quote raw (wei) — LPVault.AddLiquidity.quoteUsed
+    token_used NUMERIC NOT NULL,     -- UNIT: token raw (wei) — LPVault.AddLiquidity.tokenUsed
+    lp_burned NUMERIC NOT NULL,      -- UNIT: token raw (wei) — LP-token amount, AddLiquidity.lpBurned
+    transaction_hash VARCHAR NOT NULL,
+    block_number BIGINT NOT NULL,
+    created_at BIGINT NOT NULL,
+    log_index INT NOT NULL,
+    tx_index INT NOT NULL,
+    quote_id VARCHAR(42),
+    usd_value NUMERIC NOT NULL DEFAULT 0,  -- UNIT: USD (human) — quote_used / 10^quote_decimals * quote_price
+    PRIMARY KEY (transaction_hash, tx_index, log_index)
+);
+CREATE INDEX IF NOT EXISTS idx_vault_lp_inject_token
+    ON vault_lp_injections (token_id);
+
+-- 1.3 creator_fee_claims — CreatorFeeVault.Deposit / Claim
+CREATE TABLE IF NOT EXISTS creator_fee_claims (
+    event_type VARCHAR NOT NULL,
+    token_id VARCHAR(42) NOT NULL,
+    creator VARCHAR(42),
+    amount NUMERIC NOT NULL,         -- UNIT: quote raw (wei) — CreatorFeeVault Deposit/Claim.amount
+    new_balance NUMERIC,             -- UNIT: quote raw (wei) — CreatorFeeVault.Deposit.newBalance (NULL on CLAIM)
+    transaction_hash VARCHAR NOT NULL,
+    block_number BIGINT NOT NULL,
+    created_at BIGINT NOT NULL,
+    log_index INT NOT NULL,
+    tx_index INT NOT NULL,
+    quote_id VARCHAR(42),
+    usd_value NUMERIC NOT NULL DEFAULT 0,  -- UNIT: USD (human) — amount / 10^quote_decimals * quote_price
+    PRIMARY KEY (transaction_hash, tx_index, log_index)
+);
+CREATE INDEX IF NOT EXISTS idx_creator_fee_claims_token
+    ON creator_fee_claims (token_id);
+ALTER TABLE creator_fee_claims
+    DROP CONSTRAINT IF EXISTS creator_fee_claims_event_type_check;
+ALTER TABLE creator_fee_claims
+    ADD CONSTRAINT creator_fee_claims_event_type_check
+    CHECK (event_type IN ('DEPOSIT', 'CLAIM'));
+
+-- 1.4 gifts — GiftVault.Setup / Deposit / Claim / Expire / ReceiverSet
+--   Setup identifies the target by platform and platform_id; Claim and
+--   ReceiverSet identify the receiving account through receiver.
+CREATE TABLE IF NOT EXISTS gifts (
+    event_type VARCHAR NOT NULL,
+    token_id VARCHAR(42) NOT NULL,
+    platform VARCHAR,
+    platform_id VARCHAR,
+    receiver VARCHAR(42),
+    amount NUMERIC,                  -- UNIT: quote raw (wei) — GiftVault Deposit/Claim/Expire.amount (NULL on SETUP/RECEIVER_SET)
+    new_balance NUMERIC,             -- UNIT: quote raw (wei) — GiftVault.Deposit.newBalance (NULL on non-DEPOSIT)
+    transaction_hash VARCHAR NOT NULL,
+    block_number BIGINT NOT NULL,
+    created_at BIGINT NOT NULL,
+    log_index INT NOT NULL,
+    tx_index INT NOT NULL,
+    quote_id VARCHAR(42),
+    usd_value NUMERIC NOT NULL DEFAULT 0,  -- UNIT: USD (human) — amount / 10^quote_decimals * quote_price
+    -- Gift expiry epoch (unix seconds). Meaningful on SETUP rows
+    -- (= block_timestamp + GIFT_EXPIRY_DURATION) and on RECEIVER_SET
+    -- rows (= 0, expiry cleared). Other event types record 0 as a
+    -- placeholder; consumers read gift_vault_stats.expires_at for
+    -- the live value.
+    expires_at BIGINT NOT NULL DEFAULT 0,
+    PRIMARY KEY (transaction_hash, tx_index, log_index)
+);
+
+ALTER TABLE gifts DROP CONSTRAINT IF EXISTS gifts_platform_check;
+ALTER TABLE gifts ADD CONSTRAINT gifts_platform_check
+    CHECK (platform IS NULL OR platform IN ('GITHUB', 'X'));
+
+ALTER TABLE gifts DROP CONSTRAINT IF EXISTS gifts_event_type_check;
+ALTER TABLE gifts ADD CONSTRAINT gifts_event_type_check
+    CHECK (event_type IN ('SETUP', 'DEPOSIT', 'CLAIM', 'EXPIRE', 'RECEIVER_SET'));
+
+CREATE INDEX IF NOT EXISTS idx_gifts_token
+    ON gifts (token_id);
+CREATE INDEX IF NOT EXISTS idx_gifts_setup
+    ON gifts (platform, platform_id) WHERE event_type = 'SETUP';
+
+-- 1.5 creator_updates — CreatorFeeVault.VaultSetup / CreatorUpdate
+--   event_type='SETUP'  -> initial creator bind (old_creator NULL)
+--   event_type='UPDATE' -> subsequent creator change
+CREATE TABLE IF NOT EXISTS creator_updates (
+    event_type VARCHAR NOT NULL,
+    token_id VARCHAR(42) NOT NULL,
+    old_creator VARCHAR(42),
+    new_creator VARCHAR(42) NOT NULL,
+    transaction_hash VARCHAR NOT NULL,
+    block_number BIGINT NOT NULL,
+    created_at BIGINT NOT NULL,
+    log_index INT NOT NULL,
+    tx_index INT NOT NULL,
+    PRIMARY KEY (transaction_hash, tx_index, log_index)
+);
+ALTER TABLE creator_updates
+    DROP CONSTRAINT IF EXISTS creator_updates_event_type_check;
+ALTER TABLE creator_updates
+    ADD CONSTRAINT creator_updates_event_type_check
+    CHECK (event_type IN ('SETUP', 'UPDATE'));
+CREATE INDEX IF NOT EXISTS idx_creator_updates_token
+    ON creator_updates (token_id);
+CREATE INDEX IF NOT EXISTS idx_creator_updates_new_creator
+    ON creator_updates (new_creator);
+
+-- 1.6 gift_expiry_updates — GiftVault.ExpiryUpdate (governance config)
+CREATE TABLE IF NOT EXISTS gift_expiry_updates (
+    old_duration NUMERIC NOT NULL,   -- UNIT: seconds — GiftVault.ExpiryUpdate.oldDuration (gift expiry window)
+    new_duration NUMERIC NOT NULL,   -- UNIT: seconds — GiftVault.ExpiryUpdate.newDuration (gift expiry window)
+    transaction_hash VARCHAR NOT NULL,
+    block_number BIGINT NOT NULL,
+    created_at BIGINT NOT NULL,
+    log_index INT NOT NULL,
+    tx_index INT NOT NULL,
+    PRIMARY KEY (transaction_hash, tx_index, log_index)
+);
+
+-- 1.7 vault_registry — VaultRegistry.Register (append-only log)
+CREATE TABLE IF NOT EXISTS vault_registry (
+    vault_id VARCHAR(42) NOT NULL,
+    transaction_hash VARCHAR NOT NULL,
+    block_number BIGINT NOT NULL,
+    created_at BIGINT NOT NULL,
+    log_index INT NOT NULL,
+    tx_index INT NOT NULL,
+    PRIMARY KEY (transaction_hash, tx_index, log_index)
+);
+CREATE INDEX IF NOT EXISTS idx_vault_registry_vault
+    ON vault_registry (vault_id);
+
+-- 1.8 vault_metadata — denormalized per-vault catalog. One row per
+--     registered vault. Upserted on Register (name / creator / vault_type
+--     + fetched metadata JSON), `active` toggled by Deactivate.
+--     metadata / metadata_uri may be NULL if off-chain fetch failed.
+CREATE TABLE IF NOT EXISTS vault_metadata (
+    vault_id VARCHAR(42) PRIMARY KEY,
+    name VARCHAR NOT NULL,
+    creator VARCHAR(42) NOT NULL,
+    vault_type VARCHAR NOT NULL
+        CONSTRAINT vault_metadata_type_check
+        CHECK (vault_type IN ('CUSTOM','BURN','LP','CREATOR_FEE','GIFT','DIVIDEND')),
+    active BOOLEAN NOT NULL DEFAULT TRUE,
+    metadata_uri VARCHAR,
+    metadata JSONB,
+    metadata_fetched_at BIGINT,
+    registered_at BIGINT NOT NULL,
+    updated_at BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_vault_metadata_type
+    ON vault_metadata (vault_type);
+CREATE INDEX IF NOT EXISTS idx_vault_metadata_active
+    ON vault_metadata (active) WHERE active;
+
+-- 1.9 creator_fee_allocation — per-token vault distribution percentages
+--   from CreatorFeeProcessor.Setup(token, vaults[(vault, bps)]).
+--   PK = (token_id, vault_id). Re-Setup of the same token UPSERTs
+--   each row's bps. Drives UI fee-distribution % displays.
+CREATE TABLE IF NOT EXISTS creator_fee_allocation (
+    token_id VARCHAR(42) NOT NULL,
+    vault_id VARCHAR(42) NOT NULL,
+    bps INT NOT NULL,
+    transaction_hash VARCHAR NOT NULL,
+    block_number BIGINT NOT NULL,
+    created_at BIGINT NOT NULL,
+    log_index INT NOT NULL,
+    tx_index INT NOT NULL,
+    PRIMARY KEY (token_id, vault_id)
+);
+ALTER TABLE creator_fee_allocation
+    DROP CONSTRAINT IF EXISTS creator_fee_allocation_bps_check;
+ALTER TABLE creator_fee_allocation
+    ADD CONSTRAINT creator_fee_allocation_bps_check
+    CHECK (bps >= 0 AND bps <= 10000);
+CREATE INDEX IF NOT EXISTS idx_creator_fee_allocation_vault
+    ON creator_fee_allocation (vault_id);
+
+-- ======================================================================
+-- 2. Pre-aggregated stat tables (one row per token)
+-- ----------------------------------------------------------------------
+-- Each vault aggregates from its own event tables — no cross-vault JOIN,
+-- no VaultRegistry dependency. creator_fee_distribution stays a pure
+-- event log and is NOT an aggregation source (BurnVault / LPVault never
+-- emit a "deposit" event of their own).
+--
+-- current_balance on creator_fee / gift mirrors on-chain `_balances` /
+-- `gift.balance` exactly:
+--   DEPOSIT → set to Deposit.newBalance (from the event row)
+--   CLAIM   → 0
+--   EXPIRE  → 0     (gift only — sweep + buyback zeros gift.balance)
+-- ======================================================================
+
+-- 2.1 BurnVault — buyback+burn totals. No "received" metric (BurnVault
+--     never emits a Deposit event).
+CREATE TABLE IF NOT EXISTS burn_vault_stats (
+    token_id VARCHAR(42) PRIMARY KEY,
+    quote_spent NUMERIC NOT NULL DEFAULT 0,      -- UNIT: quote raw (wei) — SUM(vault_burns.quote_in)
+    quote_spent_usd NUMERIC NOT NULL DEFAULT 0,  -- UNIT: USD (human) — SUM(vault_burns.usd_value)
+    tokens_burned NUMERIC NOT NULL DEFAULT 0,    -- UNIT: token raw (wei) — SUM(vault_burns.token_burned)
+    burn_count INT NOT NULL DEFAULT 0,
+    last_block BIGINT NOT NULL DEFAULT 0,
+    updated_at BIGINT NOT NULL DEFAULT 0
+);
+
+-- 2.2 LPVault — LP injection totals.
+CREATE TABLE IF NOT EXISTS lp_vault_stats (
+    token_id VARCHAR(42) PRIMARY KEY,
+    quote_injected NUMERIC NOT NULL DEFAULT 0,      -- UNIT: quote raw (wei) — SUM(vault_lp_injections.quote_used)
+    quote_injected_usd NUMERIC NOT NULL DEFAULT 0,  -- UNIT: USD (human) — SUM(vault_lp_injections.usd_value)
+    token_injected NUMERIC NOT NULL DEFAULT 0,      -- UNIT: token raw (wei) — SUM(vault_lp_injections.token_used)
+    lp_burned NUMERIC NOT NULL DEFAULT 0,           -- UNIT: token raw (wei) — LP-token, SUM(vault_lp_injections.lp_burned)
+    inject_count INT NOT NULL DEFAULT 0,
+    last_block BIGINT NOT NULL DEFAULT 0,
+    updated_at BIGINT NOT NULL DEFAULT 0
+);
+
+-- 2.3 CreatorFeeVault — deposit / claim totals + live balance mirror.
+CREATE TABLE IF NOT EXISTS creator_fee_vault_stats (
+    token_id VARCHAR(42) PRIMARY KEY,
+    current_balance NUMERIC NOT NULL DEFAULT 0,      -- UNIT: quote raw (wei) — mirrors Deposit.newBalance, 0 after CLAIM
+    total_deposited NUMERIC NOT NULL DEFAULT 0,      -- UNIT: quote raw (wei) — SUM(DEPOSIT amount)
+    total_deposited_usd NUMERIC NOT NULL DEFAULT 0,  -- UNIT: USD (human) — SUM(DEPOSIT usd_value)
+    total_claimed NUMERIC NOT NULL DEFAULT 0,        -- UNIT: quote raw (wei) — SUM(CLAIM amount)
+    total_claimed_usd NUMERIC NOT NULL DEFAULT 0,    -- UNIT: USD (human) — SUM(CLAIM usd_value)
+    deposit_count INT NOT NULL DEFAULT 0,
+    claim_count INT NOT NULL DEFAULT 0,
+    last_block BIGINT NOT NULL DEFAULT 0,
+    updated_at BIGINT NOT NULL DEFAULT 0
+);
+
+-- 2.4 GiftVault — full lifecycle + current_state + live balance mirror.
+--   platform / platform_id captured from the SETUP event (X handle,
+--   GitHub login, ...). receiver captured from the RECEIVER_SET event
+--   so consumers (gift-bot, UI) can read current bind state without
+--   joining gifts.
+CREATE TABLE IF NOT EXISTS gift_vault_stats (
+    token_id VARCHAR(42) PRIMARY KEY,
+    current_state VARCHAR NOT NULL DEFAULT 'Accumulating',
+    current_balance NUMERIC NOT NULL DEFAULT 0,          -- UNIT: quote raw (wei) — mirrors Deposit.newBalance, 0 after CLAIM/EXPIRE
+    platform VARCHAR,
+    platform_id VARCHAR,
+    receiver VARCHAR(42),
+    total_deposited NUMERIC NOT NULL DEFAULT 0,          -- UNIT: quote raw (wei) — SUM(DEPOSIT amount)
+    total_deposited_usd NUMERIC NOT NULL DEFAULT 0,      -- UNIT: USD (human) — SUM(DEPOSIT usd_value)
+    total_claimed NUMERIC NOT NULL DEFAULT 0,            -- UNIT: quote raw (wei) — SUM(CLAIM amount)
+    total_claimed_usd NUMERIC NOT NULL DEFAULT 0,        -- UNIT: USD (human) — SUM(CLAIM usd_value)
+    total_expired NUMERIC NOT NULL DEFAULT 0,            -- UNIT: quote raw (wei) — SUM(EXPIRE amount)
+    total_expired_usd NUMERIC NOT NULL DEFAULT 0,        -- UNIT: USD (human) — SUM(EXPIRE usd_value)
+    buyback_quote_spent NUMERIC NOT NULL DEFAULT 0,      -- UNIT: quote raw (wei) — SUM(vault_burns.quote_in WHERE vault_type='GIFT')
+    buyback_quote_spent_usd NUMERIC NOT NULL DEFAULT 0,  -- UNIT: USD (human) — SUM(GIFT-burn usd_value)
+    buyback_tokens NUMERIC NOT NULL DEFAULT 0,           -- UNIT: token raw (wei) — SUM(vault_burns.token_burned WHERE vault_type='GIFT')
+    -- Current expiry epoch for the gift. Set from the SETUP event's
+    -- expires_at (= setup block_timestamp + GIFT_EXPIRY_DURATION) and
+    -- cleared to 0 when a RECEIVER_SET event lands (gift is claimed by
+    -- a bound receiver, no longer expires).
+    expires_at BIGINT NOT NULL DEFAULT 0,
+    -- block_timestamp of the RECEIVER_SET event that bound this gift
+    -- to its receiver. 0 while the gift is still 'Accumulating'.
+    receiver_set_at BIGINT NOT NULL DEFAULT 0,
+    last_block BIGINT NOT NULL DEFAULT 0,
+    updated_at BIGINT NOT NULL DEFAULT 0
+);
+
+-- 2.5 CreatorFeeDistribution — per-(token, vault) fee distribution totals.
+--     Sourced from CreatorFeeProcessor.Distribute events
+--     (event_type = 'DISTRIBUTE') in creator_fee_distribution. Unlike
+--     vault-side stats, this captures the *outgoing* fee a token routed to
+--     each vault. CALLBACKFAIL rows are ignored (failed distribution
+--     attempts; on-chain side handles refunds separately).
+CREATE TABLE IF NOT EXISTS creator_fee_distribution_stats (
+    token_id              VARCHAR(42) NOT NULL,
+    vault_id              VARCHAR(42) NOT NULL,
+    quote_id              VARCHAR(42) NOT NULL,
+    distributed_quote     NUMERIC     NOT NULL DEFAULT 0,  -- UNIT: quote raw (wei) — SUM(creator_fee_distribution.amount WHERE event_type='DISTRIBUTE')
+    distributed_quote_usd NUMERIC     NOT NULL DEFAULT 0,  -- UNIT: USD (human) — SUM(DISTRIBUTE usd_value)
+    distribute_count      INT         NOT NULL DEFAULT 0,
+    last_block            BIGINT      NOT NULL DEFAULT 0,
+    updated_at            BIGINT      NOT NULL DEFAULT 0,
+    PRIMARY KEY (token_id, vault_id)
+);
+
+ALTER TABLE gift_vault_stats
+    DROP CONSTRAINT IF EXISTS gift_vault_stats_platform_check;
+ALTER TABLE gift_vault_stats
+    ADD CONSTRAINT gift_vault_stats_platform_check
+    CHECK (platform IS NULL OR platform IN ('GITHUB', 'X'));
+
+ALTER TABLE gift_vault_stats
+    DROP CONSTRAINT IF EXISTS gift_vault_stats_state_check;
+ALTER TABLE gift_vault_stats
+    ADD CONSTRAINT gift_vault_stats_state_check
+    CHECK (current_state IN ('Accumulating','Active','Burned'));
+
+-- Supporting indexes for event queries and aggregate maintenance.
+CREATE INDEX IF NOT EXISTS idx_vault_burns_type_token
+    ON vault_burns (vault_type, token_id);
+CREATE INDEX IF NOT EXISTS idx_creator_fee_claims_event_token
+    ON creator_fee_claims (event_type, token_id);
+CREATE INDEX IF NOT EXISTS idx_gifts_event_token
+    ON gifts (event_type, token_id);
+CREATE INDEX IF NOT EXISTS idx_creator_fee_dist_vault_event
+    ON creator_fee_distribution (vault, event_type);
+
+-- Profile gift-fee endpoint (`GET /profile/gift-fee/{account_id}`) filters by
+-- receiver and orders by claimable balance (current_balance DESC). Partial
+-- index on (receiver, current_balance DESC) WHERE receiver IS NOT NULL covers
+-- both WHERE and ORDER BY in a single index-only scan, and excludes the
+-- "Accumulating" rows that have NULL receiver to keep the index small.
+CREATE INDEX IF NOT EXISTS idx_gift_vault_stats_receiver_balance
+    ON gift_vault_stats (receiver, current_balance DESC)
+    WHERE receiver IS NOT NULL;
+
+-- ======================================================================
+-- 3. Trigger functions + triggers
+-- ----------------------------------------------------------------------
+-- Idempotency: every * event table uses
+--   INSERT ... ON CONFLICT (transaction_hash, tx_index, log_index) DO NOTHING
+-- Postgres skips AFTER INSERT triggers when no row is actually inserted,
+-- so reorg / restart replays cannot double-count aggregates.
+-- ======================================================================
+
+-- 3.1 vault_burns → burn_stats (vault_type='BURN')
+--                   → gift_stats (vault_type='GIFT', buyback columns)
+CREATE OR REPLACE FUNCTION update_vault_burn_stats()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF NEW.vault_type = 'BURN' THEN
+        INSERT INTO burn_vault_stats
+            (token_id, quote_spent, quote_spent_usd, tokens_burned,
+             burn_count, last_block, updated_at)
+        VALUES
+            (NEW.token_id, NEW.quote_in, NEW.usd_value, NEW.token_burned, 1,
+             NEW.block_number, NEW.created_at)
+        ON CONFLICT (token_id) DO UPDATE SET
+            quote_spent     = burn_vault_stats.quote_spent     + EXCLUDED.quote_spent,
+            quote_spent_usd = burn_vault_stats.quote_spent_usd + EXCLUDED.quote_spent_usd,
+            tokens_burned   = burn_vault_stats.tokens_burned   + EXCLUDED.tokens_burned,
+            burn_count      = burn_vault_stats.burn_count      + 1,
+            last_block      = GREATEST(burn_vault_stats.last_block, EXCLUDED.last_block),
+            updated_at      = GREATEST(burn_vault_stats.updated_at, EXCLUDED.updated_at);
+    ELSIF NEW.vault_type = 'GIFT' THEN
+        INSERT INTO gift_vault_stats
+            (token_id, buyback_quote_spent, buyback_quote_spent_usd, buyback_tokens,
+             last_block, updated_at)
+        VALUES
+            (NEW.token_id, NEW.quote_in, NEW.usd_value, NEW.token_burned,
+             NEW.block_number, NEW.created_at)
+        ON CONFLICT (token_id) DO UPDATE SET
+            buyback_quote_spent     = gift_vault_stats.buyback_quote_spent     + EXCLUDED.buyback_quote_spent,
+            buyback_quote_spent_usd = gift_vault_stats.buyback_quote_spent_usd + EXCLUDED.buyback_quote_spent_usd,
+            buyback_tokens          = gift_vault_stats.buyback_tokens          + EXCLUDED.buyback_tokens,
+            last_block              = GREATEST(gift_vault_stats.last_block, EXCLUDED.last_block),
+            updated_at              = GREATEST(gift_vault_stats.updated_at, EXCLUDED.updated_at);
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_update_vault_burn_stats ON vault_burns;
+CREATE TRIGGER trg_update_vault_burn_stats
+AFTER INSERT ON vault_burns
+FOR EACH ROW EXECUTE FUNCTION update_vault_burn_stats();
+
+-- 3.2 vault_lp_injections → lp_stats
+CREATE OR REPLACE FUNCTION update_vault_lp_stats()
+RETURNS TRIGGER AS $$
+BEGIN
+    INSERT INTO lp_vault_stats
+        (token_id, quote_injected, quote_injected_usd, token_injected, lp_burned,
+         inject_count, last_block, updated_at)
+    VALUES
+        (NEW.token_id, NEW.quote_used, NEW.usd_value, NEW.token_used, NEW.lp_burned, 1,
+         NEW.block_number, NEW.created_at)
+    ON CONFLICT (token_id) DO UPDATE SET
+        quote_injected     = lp_vault_stats.quote_injected     + EXCLUDED.quote_injected,
+        quote_injected_usd = lp_vault_stats.quote_injected_usd + EXCLUDED.quote_injected_usd,
+        token_injected     = lp_vault_stats.token_injected     + EXCLUDED.token_injected,
+        lp_burned          = lp_vault_stats.lp_burned          + EXCLUDED.lp_burned,
+        inject_count       = lp_vault_stats.inject_count       + 1,
+        last_block         = GREATEST(lp_vault_stats.last_block, EXCLUDED.last_block),
+        updated_at         = GREATEST(lp_vault_stats.updated_at, EXCLUDED.updated_at);
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_update_vault_lp_stats ON vault_lp_injections;
+CREATE TRIGGER trg_update_vault_lp_stats
+AFTER INSERT ON vault_lp_injections
+FOR EACH ROW EXECUTE FUNCTION update_vault_lp_stats();
+
+-- 3.3 creator_fee_claims → creator_fee_stats
+--   DEPOSIT: current_balance = NEW.new_balance, total_deposited += amount
+--   CLAIM:   current_balance = 0,              total_claimed   += amount
+CREATE OR REPLACE FUNCTION update_creator_fee_vault_stats()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF NEW.event_type = 'DEPOSIT' THEN
+        INSERT INTO creator_fee_vault_stats
+            (token_id, current_balance, total_deposited, total_deposited_usd,
+             deposit_count, last_block, updated_at)
+        VALUES
+            (NEW.token_id, COALESCE(NEW.new_balance, 0), NEW.amount, NEW.usd_value, 1,
+             NEW.block_number, NEW.created_at)
+        ON CONFLICT (token_id) DO UPDATE SET
+            current_balance     = COALESCE(EXCLUDED.current_balance, creator_fee_vault_stats.current_balance),
+            total_deposited     = creator_fee_vault_stats.total_deposited     + EXCLUDED.total_deposited,
+            total_deposited_usd = creator_fee_vault_stats.total_deposited_usd + EXCLUDED.total_deposited_usd,
+            deposit_count       = creator_fee_vault_stats.deposit_count       + 1,
+            last_block          = GREATEST(creator_fee_vault_stats.last_block, EXCLUDED.last_block),
+            updated_at          = GREATEST(creator_fee_vault_stats.updated_at, EXCLUDED.updated_at);
+    ELSIF NEW.event_type = 'CLAIM' THEN
+        INSERT INTO creator_fee_vault_stats
+            (token_id, current_balance, total_claimed, total_claimed_usd,
+             claim_count, last_block, updated_at)
+        VALUES
+            (NEW.token_id, 0, NEW.amount, NEW.usd_value, 1,
+             NEW.block_number, NEW.created_at)
+        ON CONFLICT (token_id) DO UPDATE SET
+            current_balance   = 0,
+            total_claimed     = creator_fee_vault_stats.total_claimed     + EXCLUDED.total_claimed,
+            total_claimed_usd = creator_fee_vault_stats.total_claimed_usd + EXCLUDED.total_claimed_usd,
+            claim_count       = creator_fee_vault_stats.claim_count       + 1,
+            last_block        = GREATEST(creator_fee_vault_stats.last_block, EXCLUDED.last_block),
+            updated_at        = GREATEST(creator_fee_vault_stats.updated_at, EXCLUDED.updated_at);
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_update_creator_fee_vault_stats ON creator_fee_claims;
+CREATE TRIGGER trg_update_creator_fee_vault_stats
+AFTER INSERT ON creator_fee_claims
+FOR EACH ROW EXECUTE FUNCTION update_creator_fee_vault_stats();
+
+-- 3.4 gifts → gift_stats
+--   SETUP:        init row ('Accumulating')
+--   DEPOSIT:      current_balance = NEW.new_balance, total_deposited += amount
+--   CLAIM:        current_balance = 0,              total_claimed   += amount
+--   EXPIRE:       current_balance = 0, total_expired += amount, state = 'Burned'
+--   RECEIVER_SET: state = 'Active' (stays Burned if already Burned)
+CREATE OR REPLACE FUNCTION update_gift_vault_stats()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF NEW.event_type = 'SETUP' THEN
+        INSERT INTO gift_vault_stats
+            (token_id, current_state, platform, platform_id, expires_at,
+             last_block, updated_at)
+        VALUES
+            (NEW.token_id, 'Accumulating', NEW.platform, NEW.platform_id, NEW.expires_at,
+             NEW.block_number, NEW.created_at)
+        ON CONFLICT (token_id) DO UPDATE SET
+            platform    = COALESCE(EXCLUDED.platform, gift_vault_stats.platform),
+            platform_id = COALESCE(EXCLUDED.platform_id, gift_vault_stats.platform_id),
+            expires_at  = EXCLUDED.expires_at,
+            last_block  = GREATEST(gift_vault_stats.last_block, EXCLUDED.last_block),
+            updated_at  = GREATEST(gift_vault_stats.updated_at, EXCLUDED.updated_at);
+    ELSIF NEW.event_type = 'DEPOSIT' THEN
+        INSERT INTO gift_vault_stats
+            (token_id, current_balance, total_deposited, total_deposited_usd,
+             last_block, updated_at)
+        VALUES
+            (NEW.token_id, COALESCE(NEW.new_balance, 0), NEW.amount, NEW.usd_value,
+             NEW.block_number, NEW.created_at)
+        ON CONFLICT (token_id) DO UPDATE SET
+            current_balance     = COALESCE(EXCLUDED.current_balance, gift_vault_stats.current_balance),
+            total_deposited     = gift_vault_stats.total_deposited     + EXCLUDED.total_deposited,
+            total_deposited_usd = gift_vault_stats.total_deposited_usd + EXCLUDED.total_deposited_usd,
+            last_block          = GREATEST(gift_vault_stats.last_block, EXCLUDED.last_block),
+            updated_at          = GREATEST(gift_vault_stats.updated_at, EXCLUDED.updated_at);
+    ELSIF NEW.event_type = 'CLAIM' THEN
+        INSERT INTO gift_vault_stats
+            (token_id, current_balance, total_claimed, total_claimed_usd,
+             last_block, updated_at)
+        VALUES
+            (NEW.token_id, 0, NEW.amount, NEW.usd_value,
+             NEW.block_number, NEW.created_at)
+        ON CONFLICT (token_id) DO UPDATE SET
+            current_balance   = 0,
+            total_claimed     = gift_vault_stats.total_claimed     + EXCLUDED.total_claimed,
+            total_claimed_usd = gift_vault_stats.total_claimed_usd + EXCLUDED.total_claimed_usd,
+            last_block        = GREATEST(gift_vault_stats.last_block, EXCLUDED.last_block),
+            updated_at        = GREATEST(gift_vault_stats.updated_at, EXCLUDED.updated_at);
+    ELSIF NEW.event_type = 'EXPIRE' THEN
+        INSERT INTO gift_vault_stats
+            (token_id, current_state, current_balance, total_expired, total_expired_usd,
+             last_block, updated_at)
+        VALUES
+            (NEW.token_id, 'Burned', 0, NEW.amount, NEW.usd_value,
+             NEW.block_number, NEW.created_at)
+        ON CONFLICT (token_id) DO UPDATE SET
+            current_state     = 'Burned',
+            current_balance   = 0,
+            total_expired     = gift_vault_stats.total_expired     + EXCLUDED.total_expired,
+            total_expired_usd = gift_vault_stats.total_expired_usd + EXCLUDED.total_expired_usd,
+            last_block        = GREATEST(gift_vault_stats.last_block, EXCLUDED.last_block),
+            updated_at        = GREATEST(gift_vault_stats.updated_at, EXCLUDED.updated_at);
+    ELSIF NEW.event_type = 'RECEIVER_SET' THEN
+        INSERT INTO gift_vault_stats
+            (token_id, current_state, receiver, expires_at, receiver_set_at,
+             last_block, updated_at)
+        VALUES
+            (NEW.token_id, 'Active', NEW.receiver, 0, NEW.created_at,
+             NEW.block_number, NEW.created_at)
+        ON CONFLICT (token_id) DO UPDATE SET
+            current_state   = CASE gift_vault_stats.current_state
+                WHEN 'Burned' THEN 'Burned'  -- terminal
+                ELSE 'Active'
+            END,
+            receiver        = COALESCE(EXCLUDED.receiver, gift_vault_stats.receiver),
+            -- receiver bound → gift no longer expires
+            expires_at      = 0,
+            receiver_set_at = EXCLUDED.receiver_set_at,
+            last_block      = GREATEST(gift_vault_stats.last_block, EXCLUDED.last_block),
+            updated_at      = GREATEST(gift_vault_stats.updated_at, EXCLUDED.updated_at);
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_update_gift_vault_stats ON gifts;
+CREATE TRIGGER trg_update_gift_vault_stats
+AFTER INSERT ON gifts
+FOR EACH ROW EXECUTE FUNCTION update_gift_vault_stats();
+
+-- 3.5 creator_updates → token.creator
+--   CreatorFeeVault.VaultSetup (initial bind) and CreatorUpdate
+--   (subsequent change) are the on-chain source of truth for a token's
+--   creator after graduation. Mirror new_creator into the canonical
+--   `token` row so consumers can keep reading token.creator without
+--   joining creator_updates.
+CREATE OR REPLACE FUNCTION sync_token_creator_from_updates()
+RETURNS TRIGGER AS $$
+BEGIN
+    UPDATE token
+       SET creator = NEW.new_creator
+     WHERE token_id = NEW.token_id;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_sync_token_creator_from_updates
+    ON creator_updates;
+CREATE TRIGGER trg_sync_token_creator_from_updates
+AFTER INSERT ON creator_updates
+FOR EACH ROW EXECUTE FUNCTION sync_token_creator_from_updates();
+
+-- 3.6 creator_fee_distribution → distribution_stats
+--     Aggregates 'DISTRIBUTE' rows into per-(token, vault) totals. Other
+--     event_type values (e.g. 'CALLBACKFAIL') are skipped — failed
+--     callbacks aren't successful fee transfers.
+CREATE OR REPLACE FUNCTION update_creator_fee_distribution_stats()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF NEW.event_type <> 'DISTRIBUTE'
+       OR NEW.token IS NULL
+       OR NEW.vault IS NULL THEN
+        RETURN NEW;
+    END IF;
+
+    INSERT INTO creator_fee_distribution_stats
+        (token_id, vault_id, quote_id,
+         distributed_quote, distributed_quote_usd,
+         distribute_count, last_block, updated_at)
+    VALUES
+        (NEW.token, NEW.vault, NEW.quote_id,
+         NEW.amount, NEW.usd_value,
+         1, NEW.block_number, NEW.created_at)
+    ON CONFLICT (token_id, vault_id) DO UPDATE SET
+        distributed_quote     = creator_fee_distribution_stats.distributed_quote
+                              + EXCLUDED.distributed_quote,
+        distributed_quote_usd = creator_fee_distribution_stats.distributed_quote_usd
+                              + EXCLUDED.distributed_quote_usd,
+        distribute_count      = creator_fee_distribution_stats.distribute_count + 1,
+        last_block            = GREATEST(creator_fee_distribution_stats.last_block,
+                                         EXCLUDED.last_block),
+        updated_at            = GREATEST(creator_fee_distribution_stats.updated_at,
+                                         EXCLUDED.updated_at);
+
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_update_creator_fee_distribution_stats
+    ON creator_fee_distribution;
+CREATE TRIGGER trg_update_creator_fee_distribution_stats
+AFTER INSERT ON creator_fee_distribution
+FOR EACH ROW EXECUTE FUNCTION update_creator_fee_distribution_stats();
+
+-- ======================================================================
+-- 4. One-time backfill from existing event data.
+--    ON CONFLICT DO NOTHING makes this safe to re-run: rows the trigger
+--    already maintains stay untouched.
+-- ======================================================================
+
+-- 4.1 BurnVault
+INSERT INTO burn_vault_stats
+    (token_id, quote_spent, tokens_burned, burn_count, last_block, updated_at)
+SELECT token_id,
+       SUM(quote_in),
+       SUM(token_burned),
+       COUNT(*),
+       MAX(block_number),
+       MAX(created_at)
+FROM vault_burns
+WHERE vault_type = 'BURN'
+GROUP BY token_id
+ON CONFLICT (token_id) DO NOTHING;
+
+-- 4.2 LPVault
+INSERT INTO lp_vault_stats
+    (token_id, quote_injected, token_injected, lp_burned, inject_count,
+     last_block, updated_at)
+SELECT token_id,
+       SUM(quote_used),
+       SUM(token_used),
+       SUM(lp_burned),
+       COUNT(*),
+       MAX(block_number),
+       MAX(created_at)
+FROM vault_lp_injections
+GROUP BY token_id
+ON CONFLICT (token_id) DO NOTHING;
+
+-- 4.3 CreatorFeeVault — current_balance from latest event per token.
+WITH latest AS (
+    SELECT DISTINCT ON (token_id) token_id, event_type, new_balance
+    FROM creator_fee_claims
+    ORDER BY token_id, block_number DESC, log_index DESC
+),
+totals AS (
+    SELECT token_id,
+           COALESCE(SUM(amount) FILTER (WHERE event_type = 'DEPOSIT'), 0) AS total_deposited,
+           COALESCE(SUM(amount) FILTER (WHERE event_type = 'CLAIM'),   0) AS total_claimed,
+           COUNT(*) FILTER (WHERE event_type = 'DEPOSIT') AS deposit_count,
+           COUNT(*) FILTER (WHERE event_type = 'CLAIM')   AS claim_count,
+           MAX(block_number) AS last_block,
+           MAX(created_at)   AS updated_at
+    FROM creator_fee_claims
+    GROUP BY token_id
+)
+INSERT INTO creator_fee_vault_stats
+    (token_id, current_balance, total_deposited, total_claimed,
+     deposit_count, claim_count, last_block, updated_at)
+SELECT t.token_id,
+       CASE l.event_type
+           WHEN 'DEPOSIT' THEN COALESCE(l.new_balance, 0)
+           ELSE 0
+       END,
+       t.total_deposited,
+       t.total_claimed,
+       t.deposit_count,
+       t.claim_count,
+       t.last_block,
+       t.updated_at
+FROM totals t
+LEFT JOIN latest l USING (token_id)
+ON CONFLICT (token_id) DO NOTHING;
+
+-- 4.4 GiftVault — current_state from event presence; current_balance
+--                 from latest balance-affecting event.
+WITH latest_bal AS (
+    SELECT DISTINCT ON (token_id) token_id, event_type, new_balance
+    FROM gifts
+    WHERE event_type IN ('DEPOSIT','CLAIM','EXPIRE')
+    ORDER BY token_id, block_number DESC, log_index DESC
+),
+latest_setup AS (
+    SELECT DISTINCT ON (token_id) token_id, platform, platform_id
+    FROM gifts
+    WHERE event_type = 'SETUP'
+    ORDER BY token_id, block_number DESC, log_index DESC
+),
+latest_receiver AS (
+    SELECT DISTINCT ON (token_id) token_id, receiver
+    FROM gifts
+    WHERE event_type = 'RECEIVER_SET'
+    ORDER BY token_id, block_number DESC, log_index DESC
+),
+totals AS (
+    SELECT token_id,
+           CASE
+               WHEN bool_or(event_type = 'EXPIRE') THEN 'Burned'
+               WHEN bool_or(event_type = 'RECEIVER_SET') THEN 'Active'
+               ELSE 'Accumulating'
+           END AS current_state,
+           COALESCE(SUM(amount) FILTER (WHERE event_type = 'DEPOSIT'), 0) AS total_deposited,
+           COALESCE(SUM(amount) FILTER (WHERE event_type = 'CLAIM'),   0) AS total_claimed,
+           COALESCE(SUM(amount) FILTER (WHERE event_type = 'EXPIRE'),  0) AS total_expired,
+           MAX(block_number) AS last_block,
+           MAX(created_at)   AS updated_at
+    FROM gifts
+    GROUP BY token_id
+),
+burns AS (
+    SELECT token_id,
+           SUM(quote_in)     AS buyback_quote_spent,
+           SUM(token_burned) AS buyback_tokens,
+           MAX(block_number) AS last_block,
+           MAX(created_at)   AS updated_at
+    FROM vault_burns
+    WHERE vault_type = 'GIFT'
+    GROUP BY token_id
+)
+INSERT INTO gift_vault_stats
+    (token_id, current_state, current_balance,
+     platform, platform_id, receiver,
+     total_deposited, total_claimed, total_expired,
+     buyback_quote_spent, buyback_tokens,
+     last_block, updated_at)
+SELECT t.token_id,
+       t.current_state,
+       CASE l.event_type
+           WHEN 'DEPOSIT' THEN COALESCE(l.new_balance, 0)
+           ELSE 0
+       END,
+       s.platform,
+       s.platform_id,
+       r.receiver,
+       t.total_deposited,
+       t.total_claimed,
+       t.total_expired,
+       COALESCE(b.buyback_quote_spent, 0),
+       COALESCE(b.buyback_tokens, 0),
+       GREATEST(t.last_block, COALESCE(b.last_block, 0)),
+       GREATEST(t.updated_at, COALESCE(b.updated_at, 0))
+FROM totals t
+LEFT JOIN latest_bal l USING (token_id)
+LEFT JOIN latest_setup s USING (token_id)
+LEFT JOIN latest_receiver r USING (token_id)
+LEFT JOIN burns b USING (token_id)
+ON CONFLICT (token_id) DO NOTHING;
+
+-- Pick up Burn-only rows (tokens that went Burned via afterDeposit
+-- without a prior gifts row for them).
+INSERT INTO gift_vault_stats
+    (token_id, current_state, buyback_quote_spent, buyback_tokens,
+     last_block, updated_at)
+SELECT token_id, 'Burned', SUM(quote_in), SUM(token_burned),
+       MAX(block_number), MAX(created_at)
+FROM vault_burns
+WHERE vault_type = 'GIFT'
+GROUP BY token_id
+ON CONFLICT (token_id) DO NOTHING;
+
+-- 4.5 Materialize token.creator from the latest creator_updates row.
+WITH latest_creator AS (
+    SELECT DISTINCT ON (token_id) token_id, new_creator
+    FROM creator_updates
+    ORDER BY token_id, block_number DESC, log_index DESC
+)
+UPDATE token t
+   SET creator = lc.new_creator
+  FROM latest_creator lc
+ WHERE t.token_id = lc.token_id
+   AND t.creator IS DISTINCT FROM lc.new_creator;
+
+-- 4.6 CreatorFeeDistribution — per-(token, vault) totals from event log.
+INSERT INTO creator_fee_distribution_stats
+    (token_id, vault_id, quote_id,
+     distributed_quote, distribute_count, last_block, updated_at)
+SELECT
+    token,
+    vault,
+    MIN(quote_id),
+    SUM(amount),
+    COUNT(*),
+    MAX(block_number),
+    MAX(created_at)
+FROM creator_fee_distribution
+WHERE event_type = 'DISTRIBUTE'
+  AND token IS NOT NULL
+  AND vault IS NOT NULL
+GROUP BY token, vault
+ON CONFLICT (token_id, vault_id) DO NOTHING;
+
+-- ======================================================================
+-- 5. USD value materialization
+-- ----------------------------------------------------------------------
+-- Step A: populate quote_id + usd_value on event rows without enrichment.
+-- Idempotent via the `WHERE usd_value = 0` guard.
+-- Live trigger inserts will land with the correct usd_value already set,
+-- so the WHERE clause skips them harmlessly.
+-- ======================================================================
+
+UPDATE vault_burns vb
+   SET quote_id  = m.quote_id,
+       usd_value = COALESCE(
+           (vb.quote_in / POWER(10, qt.decimals)::numeric) * (
+               SELECT price FROM price
+                WHERE quote_id = m.quote_id
+                  AND block_number <= vb.block_number
+                ORDER BY block_number DESC
+                LIMIT 1
+           ),
+           0
+       )
+  FROM market m
+  JOIN quote_token qt ON qt.quote_id = m.quote_id
+ WHERE vb.token_id = m.token_id
+   AND vb.usd_value = 0;
+
+UPDATE vault_lp_injections vli
+   SET quote_id  = m.quote_id,
+       usd_value = COALESCE(
+           (vli.quote_used / POWER(10, qt.decimals)::numeric) * (
+               SELECT price FROM price
+                WHERE quote_id = m.quote_id
+                  AND block_number <= vli.block_number
+                ORDER BY block_number DESC
+                LIMIT 1
+           ),
+           0
+       )
+  FROM market m
+  JOIN quote_token qt ON qt.quote_id = m.quote_id
+ WHERE vli.token_id = m.token_id
+   AND vli.usd_value = 0;
+
+UPDATE creator_fee_claims cfc
+   SET quote_id  = m.quote_id,
+       usd_value = COALESCE(
+           (cfc.amount / POWER(10, qt.decimals)::numeric) * (
+               SELECT price FROM price
+                WHERE quote_id = m.quote_id
+                  AND block_number <= cfc.block_number
+                ORDER BY block_number DESC
+                LIMIT 1
+           ),
+           0
+       )
+  FROM market m
+  JOIN quote_token qt ON qt.quote_id = m.quote_id
+ WHERE cfc.token_id = m.token_id
+   AND cfc.usd_value = 0;
+
+-- gifts: only DEPOSIT/CLAIM/EXPIRE rows have a real amount.
+-- SETUP/RECEIVER_SET have amount NULL; leave their usd_value at default 0.
+UPDATE gifts g
+   SET quote_id  = m.quote_id,
+       usd_value = COALESCE(
+           (g.amount / POWER(10, qt.decimals)::numeric) * (
+               SELECT price FROM price
+                WHERE quote_id = m.quote_id
+                  AND block_number <= g.block_number
+                ORDER BY block_number DESC
+                LIMIT 1
+           ),
+           0
+       )
+  FROM market m
+  JOIN quote_token qt ON qt.quote_id = m.quote_id
+ WHERE g.token_id = m.token_id
+   AND g.amount IS NOT NULL
+   AND g.usd_value = 0;
+
+-- creator_fee_distribution: quote_id already on row, no market JOIN.
+UPDATE creator_fee_distribution cfd
+   SET usd_value = COALESCE(
+           (cfd.amount / POWER(10, qt.decimals)::numeric) * (
+               SELECT price FROM price
+                WHERE quote_id = cfd.quote_id
+                  AND block_number <= cfd.block_number
+                ORDER BY block_number DESC
+                LIMIT 1
+           ),
+           0
+       )
+  FROM quote_token qt
+ WHERE cfd.quote_id = qt.quote_id
+   AND cfd.event_type = 'DISTRIBUTE'
+   AND cfd.usd_value = 0;
+
+-- ----------------------------------------------------------------------
+-- Step B: backfill cumulative USD into stats tables. Sum-aggregates
+-- per token from the now-populated event rows. Guarded by `WHERE = 0`
+-- so re-runs and live trigger inserts don't double-count.
+-- ----------------------------------------------------------------------
+
+WITH s AS (
+    SELECT token_id, SUM(usd_value) AS quote_spent_usd
+      FROM vault_burns
+     WHERE vault_type = 'BURN'
+     GROUP BY token_id
+)
+UPDATE burn_vault_stats v
+   SET quote_spent_usd = s.quote_spent_usd
+  FROM s
+ WHERE v.token_id = s.token_id
+   AND v.quote_spent_usd = 0;
+
+WITH s AS (
+    SELECT token_id, SUM(usd_value) AS quote_injected_usd
+      FROM vault_lp_injections
+     GROUP BY token_id
+)
+UPDATE lp_vault_stats v
+   SET quote_injected_usd = s.quote_injected_usd
+  FROM s
+ WHERE v.token_id = s.token_id
+   AND v.quote_injected_usd = 0;
+
+WITH s AS (
+    SELECT token_id,
+           SUM(usd_value) FILTER (WHERE event_type = 'DEPOSIT') AS dep_usd,
+           SUM(usd_value) FILTER (WHERE event_type = 'CLAIM')   AS clm_usd
+      FROM creator_fee_claims
+     GROUP BY token_id
+)
+UPDATE creator_fee_vault_stats v
+   SET total_deposited_usd = COALESCE(s.dep_usd, 0),
+       total_claimed_usd   = COALESCE(s.clm_usd, 0)
+  FROM s
+ WHERE v.token_id = s.token_id
+   AND (v.total_deposited_usd = 0 AND v.total_claimed_usd = 0);
+
+WITH s AS (
+    SELECT token_id,
+           SUM(usd_value) FILTER (WHERE event_type = 'DEPOSIT') AS dep_usd,
+           SUM(usd_value) FILTER (WHERE event_type = 'CLAIM')   AS clm_usd,
+           SUM(usd_value) FILTER (WHERE event_type = 'EXPIRE')  AS exp_usd
+      FROM gifts
+     WHERE amount IS NOT NULL
+     GROUP BY token_id
+),
+b AS (
+    SELECT token_id, SUM(usd_value) AS bb_usd
+      FROM vault_burns
+     WHERE vault_type = 'GIFT'
+     GROUP BY token_id
+)
+UPDATE gift_vault_stats v
+   SET total_deposited_usd     = COALESCE(s.dep_usd, 0),
+       total_claimed_usd       = COALESCE(s.clm_usd, 0),
+       total_expired_usd       = COALESCE(s.exp_usd, 0),
+       buyback_quote_spent_usd = COALESCE(b.bb_usd, 0)
+  FROM s
+  LEFT JOIN b USING (token_id)
+ WHERE v.token_id = s.token_id
+   AND v.total_deposited_usd = 0
+   AND v.total_claimed_usd = 0
+   AND v.total_expired_usd = 0
+   AND v.buyback_quote_spent_usd = 0;
+
+WITH s AS (
+    SELECT token AS token_id, vault AS vault_id,
+           SUM(usd_value) AS distributed_quote_usd
+      FROM creator_fee_distribution
+     WHERE event_type = 'DISTRIBUTE'
+       AND token IS NOT NULL
+       AND vault IS NOT NULL
+     GROUP BY token, vault
+)
+UPDATE creator_fee_distribution_stats v
+   SET distributed_quote_usd = s.distributed_quote_usd
+  FROM s
+ WHERE v.token_id = s.token_id
+   AND v.vault_id = s.vault_id
+   AND v.distributed_quote_usd = 0;
+
+COMMIT;
+
+-- ============================================================================
+-- >>> 0036_token_x_verification.sql
+-- ============================================================================
+
+-- 0036_token_x_verification.sql
+--
+-- X (Twitter) hidden-creator verification signals, scoped to a single coin:
+-- pre-deploy reservation, creator self-verification, and public follower
+-- attestations (including X's official "blue badge" status on each
+-- attestation). See: docs/plans/2026-07-03-x-hidden-creator-verification-design.md
+-- (§3-bis, §4, §7.1-B).
+--
+-- No FK to `token` anywhere in this file: at reserve/finalize time the token
+-- row does not exist yet (the Observer indexer creates it later from the
+-- on-chain event).
+
+-- Creator self-verification result (follower count + own X handle). x_user_id
+-- and x_handle are internal (operational/admin) — never exposed by the API.
+CREATE TABLE IF NOT EXISTS token_x_verification (
+    token_id VARCHAR(42) PRIMARY KEY,
+    account_id VARCHAR(42) NOT NULL,
+    x_user_id VARCHAR(32) NOT NULL,
+    x_handle VARCHAR(16),
+    followers_count BIGINT NOT NULL,
+    verified_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_token_x_verification_account_id
+    ON token_x_verification (account_id);
+
+-- Third-party handles that provably follow the creator (max 3, public).
+-- Handles that do NOT follow are never stored. is_x_verified carries X's
+-- official "blue badge" status for the handle — a trust signal about the
+-- PUBLIC third-party handle, not the hidden creator.
+CREATE TABLE IF NOT EXISTS token_x_followed_by (
+    token_id VARCHAR(42) NOT NULL
+        REFERENCES token_x_verification(token_id) ON DELETE CASCADE,
+    x_handle VARCHAR(16) NOT NULL,
+    x_image_uri VARCHAR NOT NULL,
+    x_followers_count BIGINT NOT NULL,
+    is_x_verified BOOLEAN NOT NULL DEFAULT FALSE,
+    checked_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (token_id, x_handle)
+);
+
+-- Pre-deploy reservation binding a CREATE2 token_id to a session account while
+-- the salt is still secret (before on-chain deployment). finalize checks only
+-- that this reservation belongs to the session (design §3-bis, §7.1-B).
+--
+-- No FK to `token` or `token_x_verification`: the reservation is created BEFORE
+-- either row exists. token_id is stored EIP-55 checksummed (never LOWER()).
+-- The row is immutable once created (account_id never changes) — this is what
+-- makes the reserve INSERT a sound first-writer-wins record.
+CREATE TABLE IF NOT EXISTS token_x_reservation (
+    token_id VARCHAR(42) PRIMARY KEY,
+    account_id VARCHAR(42) NOT NULL,
+    reserved_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_token_x_reservation_account_id
+    ON token_x_reservation (account_id);
+
+-- ============================================================================
+-- >>> 0037_dev_post.sql
+-- ============================================================================
+
+-- Dev Post feature: coin-creator posts with images, polls, likes, votes.
+-- Design: docs/plans/2026-07-07-dev-post-api-design.md
+-- The GIWA deployment uses a plain PostgreSQL sequence for post ids.
+CREATE SEQUENCE IF NOT EXISTS dev_post_snowflake_seq;
+
+CREATE TABLE IF NOT EXISTS dev_post (
+    id          BIGINT PRIMARY KEY DEFAULT nextval('dev_post_snowflake_seq'),
+    token_id    VARCHAR(42) NOT NULL,
+    author      VARCHAR(42) NOT NULL,
+    title       TEXT        NOT NULL DEFAULT '',
+    body        TEXT        NOT NULL DEFAULT '',
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    posted_on   DATE GENERATED ALWAYS AS ((created_at AT TIME ZONE 'UTC')::date) STORED,
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    edited_at   TIMESTAMPTZ,
+    deleted_at  TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_dev_post_token_created ON dev_post (token_id, created_at DESC) WHERE deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_dev_post_created       ON dev_post (created_at DESC)            WHERE deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_dev_post_author        ON dev_post (author)                     WHERE deleted_at IS NULL;
+
+CREATE TABLE IF NOT EXISTS dev_post_image (
+    post_id   BIGINT   NOT NULL REFERENCES dev_post(id) ON DELETE CASCADE,
+    position  SMALLINT NOT NULL,
+    image_uri TEXT     NOT NULL,
+    PRIMARY KEY (post_id, position)
+);
+
+CREATE TABLE IF NOT EXISTS dev_post_poll (
+    post_id   BIGINT      PRIMARY KEY REFERENCES dev_post(id) ON DELETE CASCADE,
+    closes_at TIMESTAMPTZ NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS dev_post_poll_option (
+    post_id   BIGINT   NOT NULL REFERENCES dev_post_poll(post_id) ON DELETE CASCADE,
+    position  SMALLINT NOT NULL,
+    label     TEXT     NOT NULL,
+    image_uri TEXT,
+    PRIMARY KEY (post_id, position)
+);
+
+CREATE TABLE IF NOT EXISTS dev_post_like (
+    post_id    BIGINT      NOT NULL REFERENCES dev_post(id) ON DELETE CASCADE,
+    account_id VARCHAR(42) NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (post_id, account_id)
+);
+CREATE INDEX IF NOT EXISTS idx_dev_post_like_created ON dev_post_like (created_at, post_id);
+
+CREATE TABLE IF NOT EXISTS dev_post_poll_vote (
+    post_id         BIGINT      NOT NULL REFERENCES dev_post_poll(post_id) ON DELETE CASCADE,
+    account_id      VARCHAR(42) NOT NULL,
+    option_position SMALLINT    NOT NULL,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (post_id, account_id),
+    FOREIGN KEY (post_id, option_position) REFERENCES dev_post_poll_option(post_id, position)
+);
+
+-- ============================================================================
+-- >>> 0039_dev_post_pin.sql
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS dev_post_pin (
+    token_id VARCHAR(42) PRIMARY KEY
+        REFERENCES token(token_id) ON DELETE CASCADE,
+    post_id BIGINT NOT NULL UNIQUE
+        REFERENCES dev_post(id) ON DELETE CASCADE,
+    pinned_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- ============================================================================
+-- >>> 0040_dev_post_moderation_log.sql
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS dev_post_moderation_log (
+    id               UUID        PRIMARY KEY,
+    post_id          BIGINT      NOT NULL CHECK (post_id > 0),
+    token_id         VARCHAR(42) NOT NULL,
+    admin_account_id VARCHAR(42) NOT NULL,
+    action           VARCHAR(8)  NOT NULL
+        CHECK (action IN ('DELETE', 'RESTORE')),
+    changed          BOOLEAN     NOT NULL,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
+);
+
+CREATE INDEX IF NOT EXISTS idx_dev_post_moderation_log_post_created
+    ON dev_post_moderation_log (post_id, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_dev_post_moderation_log_admin_created
+    ON dev_post_moderation_log (admin_account_id, created_at DESC);
+
+-- ============================================================================
+-- >>> 0042_dev_post_daily_limit.sql
+-- ============================================================================
+
+-- Daily dev-post limit support: up to N posts (currently 3, app-enforced)
+-- per token per UTC calendar day.
+--
+-- posted_on is a stored generated column so the app's count gate
+-- (`WHERE token_id = $1 AND posted_on = <today UTC>`) is a cheap indexed
+-- lookup. Enforcement lives in create_post's CTE — a unique index can cap at
+-- exactly one row but cannot express "at most 3", so a burst of concurrent
+-- creates can momentarily exceed the cap; acceptable for spam limiting.
+--
+-- Deleted posts still count toward the day's quota (the app counts without a
+-- deleted_at filter): deleting does not free a slot, edits exist for
+-- corrections.
+
+CREATE INDEX IF NOT EXISTS idx_dev_post_token_daily
+    ON dev_post (token_id, posted_on);
