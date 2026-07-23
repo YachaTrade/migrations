@@ -1191,7 +1191,7 @@ ALTER TABLE lp_allocate_history ENABLE TRIGGER trigger_update_lp_collect_status_
 
 CREATE TABLE IF NOT EXISTS lp_collect_history(
     token_id VARCHAR(42) NOT NULL,
-    quote_amount NUMERIC NOT NULL, -- quote raw (wei); total distributed LpManagerCollect.quoteAmount
+    quote_amount NUMERIC NOT NULL, -- quote raw (wei); total distributed LPManager.Collect.quoteAmount
     transaction_hash VARCHAR NOT NULL,
     tx_index INT NOT NULL,
     log_index INT NOT NULL,
