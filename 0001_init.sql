@@ -1191,11 +1191,7 @@ ALTER TABLE lp_allocate_history ENABLE TRIGGER trigger_update_lp_collect_status_
 
 CREATE TABLE IF NOT EXISTS lp_collect_history(
     token_id VARCHAR(42) NOT NULL,
-    quote_amount NUMERIC NOT NULL, -- quote raw (wei); LpManagerCollect.monAmount
-    token_amount NUMERIC NOT NULL, --token treasury -- token raw (wei); LpManagerCollect.tokenAmount
-    c_amount NUMERIC NOT NULL, --creator treasury -- quote raw (wei); quote_amount * creatorTreasuryFeeRate / 1e6
-    ft_amount NUMERIC NOT NULL, --foundation treasury -- quote raw (wei); quote_amount * foundationTreasuryFeeRate / 1e6
-    ct_amount NUMERIC NOT NULL, --community treasury -- quote raw (wei); quote_amount * communityTreasuryFeeRate / 1e6
+    quote_amount NUMERIC NOT NULL, -- quote raw (wei); total distributed LPManager.Collect.quoteAmount
     transaction_hash VARCHAR NOT NULL,
     tx_index INT NOT NULL,
     log_index INT NOT NULL,
