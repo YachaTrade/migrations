@@ -1198,7 +1198,8 @@ CREATE TABLE IF NOT EXISTS lp_collect_history(
     created_at BIGINT NOT NULL DEFAULT EXTRACT(EPOCH FROM CURRENT_TIMESTAMP)::BIGINT,
     PRIMARY KEY (token_id,transaction_hash,tx_index,log_index)
 );
--- LP Collect History 테이블은 PRIMARY KEY 외에 추가 인덱스 불필요 (INSERT만 수행)
+CREATE INDEX IF NOT EXISTS idx_lp_collect_history_transaction_hash
+    ON lp_collect_history (transaction_hash);
 
 
 CREATE OR REPLACE FUNCTION update_lp_collect_status_from_collect()
@@ -1233,6 +1234,20 @@ CREATE TABLE IF NOT EXISTS lp_collect_status(
     PRIMARY KEY (token_id)
 );
 -- LP Collect Status는 UPDATE에서 WHERE token_id = $1 사용하므로 PRIMARY KEY만으로 충분
+
+CREATE TABLE IF NOT EXISTS txbot_collect_pending (
+    singleton_id SMALLINT PRIMARY KEY CHECK (singleton_id = 1),
+    state VARCHAR NOT NULL CHECK (state IN ('RESERVED', 'BROADCAST')),
+    tx_hash VARCHAR(66) UNIQUE,
+    token_ids VARCHAR(42)[] NOT NULL,
+    created_at BIGINT NOT NULL DEFAULT EXTRACT(EPOCH FROM CURRENT_TIMESTAMP)::BIGINT,
+    updated_at BIGINT NOT NULL DEFAULT EXTRACT(EPOCH FROM CURRENT_TIMESTAMP)::BIGINT,
+    CHECK (
+        (state = 'RESERVED' AND tx_hash IS NULL)
+        OR
+        (state = 'BROADCAST' AND tx_hash IS NOT NULL)
+    )
+);
 
 
 
